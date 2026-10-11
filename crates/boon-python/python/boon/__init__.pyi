@@ -627,6 +627,8 @@ class Demo:
         only for shown icons. `last_seen_*` is carried from the last shown row
         of the same resolved pawn lifetime. Unbound rows retain their raw FOW
         entity index and leave identity and last-seen columns null.
+        `target_steam_id` is present only when one active controller with a
+        recorded Steam ID points to that exact pawn lifetime.
         """
         ...
 

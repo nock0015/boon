@@ -42,8 +42,11 @@ coordinates are invalid. These values are not world coordinates.
 
 `target_entity_index` and `target_entity_serial` are filled only when the
 recorded FOW index resolves uniquely to a current player pawn. `target_hero_id`
-then comes from that pawn. The raw FOW index is always retained so unresolved
-rows remain inspectable. `last_seen_tick`, `last_seen_x`, and `last_seen_y`
+then comes from that pawn. `target_steam_id` comes from the one active player
+controller whose current serial-bearing pawn handle points to the same pawn.
+It is null if the controller or Steam ID is unavailable, the forward handles
+disagree, or multiple controllers claim that pawn. The raw FOW index is always
+retained so unresolved rows remain inspectable. `last_seen_tick`, `last_seen_x`, and `last_seen_y`
 carry the last *shown* coordinate for that same resolved pawn identity on that
 team's channel. These columns stay null when the pawn identity cannot be
 resolved or has not yet been shown. The raw `tick_hidden_raw` is also exposed;

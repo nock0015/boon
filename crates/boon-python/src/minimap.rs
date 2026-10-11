@@ -4,6 +4,67 @@
 use crate::*;
 use boon_parser::{Context, Entity, FieldValue, Serializer};
 
+#[derive(Clone, Copy, Default)]
+struct ControllerKeys {
+    steam_id: Option<u64>,
+    pawn: Option<u64>,
+    hero_pawn: Option<u64>,
+}
+
+impl ControllerKeys {
+    fn resolve(ctx: &Context) -> Self {
+        let serializer = ctx.serializers().get("CCitadelPlayerController");
+        let key = |name| serializer.and_then(|s| s.resolve_field_key(name));
+        Self {
+            steam_id: key("m_steamID"),
+            pawn: key("m_hPawn"),
+            hero_pawn: key("m_hHeroPawn"),
+        }
+    }
+}
+
+/// Bind only controllers whose current serial-bearing pawn handles agree.
+/// More than one controller for a pawn makes its Steam ID ambiguous.
+fn controller_steam_ids(
+    ctx: &Context,
+    keys: ControllerKeys,
+) -> HashMap<boon_parser::EntityId, Option<u64>> {
+    let mut by_pawn = HashMap::new();
+    for (_, controller) in ctx.entities().iter().filter(|(_, entity)| {
+        entity.active && entity.class_name.as_ref() == "CCitadelPlayerController"
+    }) {
+        let mut pawns = Vec::new();
+        for key in [keys.pawn, keys.hero_pawn] {
+            let Some(pawn) = controller
+                .get_handle(key)
+                .and_then(|handle| ctx.entities().get_by_handle(handle))
+                .filter(|entity| entity.class_name.as_ref() == "CCitadelPlayerPawn")
+            else {
+                continue;
+            };
+            if !pawns.contains(&pawn.id()) {
+                pawns.push(pawn.id());
+            }
+        }
+        if pawns.len() != 1 {
+            continue;
+        }
+        let steam_id = match controller.field_value(keys.steam_id) {
+            Some(FieldValue::U64(id)) if *id != 0 => Some(*id),
+            _ => None,
+        };
+        match by_pawn.entry(pawns[0]) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(steam_id);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(None);
+            }
+        }
+    }
+    by_pawn
+}
+
 fn integer(value: &FieldValue) -> Option<i64> {
     match value {
         FieldValue::I32(n) => Some(i64::from(*n)),
@@ -69,6 +130,7 @@ struct MinimapCols {
     observer_team: Vec<i64>,
     target_team: Vec<i64>,
     target_hero_id: Vec<Option<i64>>,
+    target_steam_id: Vec<Option<u64>>,
     target_entity_index: Vec<Option<i32>>,
     target_entity_serial: Vec<Option<u32>>,
     fow_entity_index_raw: Vec<i64>,
@@ -88,11 +150,13 @@ impl MinimapCols {
         ctx: &Context,
         hero_key: Option<u64>,
         pawn_team_key: Option<u64>,
+        controller_keys: ControllerKeys,
         emit: bool,
     ) {
         let Some(serializer) = ctx.serializers().get("CCitadelTeam") else {
             return;
         };
+        let steam_ids = emit.then(|| controller_steam_ids(ctx, controller_keys));
         for (_, team) in ctx
             .entities()
             .iter()
@@ -159,6 +223,12 @@ impl MinimapCols {
                     pawn.and_then(|p| hero_key.map(|key| p.get_i64(Some(key))))
                         .filter(|&id| id > 0),
                 );
+                self.target_steam_id.push(
+                    identity
+                        .and_then(|id| steam_ids.as_ref()?.get(&id))
+                        .copied()
+                        .flatten(),
+                );
                 self.target_entity_index.push(identity.map(|id| id.index));
                 self.target_entity_serial.push(identity.map(|id| id.serial));
                 self.fow_entity_index_raw.push(raw_index);
@@ -181,6 +251,7 @@ impl MinimapCols {
             Column::new("observer_team".into(), self.observer_team),
             Column::new("target_team".into(), self.target_team),
             Column::new("target_hero_id".into(), self.target_hero_id),
+            Column::new("target_steam_id".into(), self.target_steam_id),
             Column::new("target_entity_index".into(), self.target_entity_index),
             Column::new("target_entity_serial".into(), self.target_entity_serial),
             Column::new("fow_entity_index_raw".into(), self.fow_entity_index_raw),
@@ -206,6 +277,7 @@ impl Demo {
     /// native 0..255 map bytes and are populated only while the icon is shown.
     /// Last-seen coordinates come only from a prior shown row with the same
     /// pawn entity identity; unresolved identities keep those fields null.
+    /// `target_steam_id` requires one active controller bound to that pawn.
     /// Pass `ticks` to sample exact replay ticks, or `every` for a tick stride.
     #[pyo3(signature = (*, ticks=None, every=None))]
     pub(crate) fn enemy_minimap_ticks(
@@ -229,7 +301,12 @@ impl Demo {
                 .serializers()
                 .get("CCitadelPlayerPawn")
                 .and_then(|s| s.resolve_field_key("m_iTeamNum"));
-            let filter = HashSet::from(["CCitadelTeam", "CCitadelPlayerPawn"]);
+            let controller_keys = ControllerKeys::resolve(&init);
+            let filter = HashSet::from([
+                "CCitadelTeam",
+                "CCitadelPlayerPawn",
+                "CCitadelPlayerController",
+            ]);
             let mut cols = MinimapCols::default();
             let mut last_sample: Option<i32> = None;
             self.parser
@@ -242,7 +319,7 @@ impl Demo {
                     if emit && every.is_some() {
                         last_sample = Some(tick);
                     }
-                    cols.collect(ctx, hero_key, pawn_team_key, emit);
+                    cols.collect(ctx, hero_key, pawn_team_key, controller_keys, emit);
                 })
                 .map_err(to_py_err)?;
             cols.into_frame().map(PyDataFrame)

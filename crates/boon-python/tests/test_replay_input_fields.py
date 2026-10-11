@@ -20,7 +20,7 @@ def test_recorded_upgrade_vector_is_distinct_from_missing(demo: Demo) -> None:
 def test_enemy_minimap_uses_recorded_team_icons(demo: Demo) -> None:
     frame = demo.enemy_minimap_ticks(every=640)
     assert set(frame.columns) == {
-        "tick", "observer_team", "target_team", "target_hero_id",
+        "tick", "observer_team", "target_team", "target_hero_id", "target_steam_id",
         "target_entity_index", "target_entity_serial", "fow_entity_index_raw",
         "visible_on_map", "map_x", "map_y", "tick_hidden_raw",
         "last_seen_tick", "last_seen_x", "last_seen_y",
@@ -28,6 +28,9 @@ def test_enemy_minimap_uses_recorded_team_icons(demo: Demo) -> None:
     if frame.is_empty():
         pytest.skip("fixture has no decoded enemy FOW rows")
     assert frame.filter(pl.col("observer_team") == pl.col("target_team")).is_empty()
+    assert frame.filter(
+        pl.col("target_entity_index").is_null() & pl.col("target_steam_id").is_not_null()
+    ).is_empty()
     assert not frame.filter(~pl.col("visible_on_map").fill_null(False)).select(
         pl.col("map_x").is_not_null().any() | pl.col("map_y").is_not_null().any()
     ).item()
@@ -37,6 +40,28 @@ def test_enemy_minimap_uses_recorded_team_icons(demo: Demo) -> None:
         | (pl.col("map_y") < 0) | (pl.col("map_y") > 255)
     ).is_empty()
     assert frame.filter(pl.col("last_seen_tick") > pl.col("tick")).is_empty()
+
+
+def test_enemy_minimap_steam_id_follows_unique_pawn_controller(demo: Demo) -> None:
+    frame = demo.enemy_minimap_ticks(every=640)
+    assert frame.schema["target_steam_id"] == pl.UInt64
+    known = frame.filter(pl.col("target_steam_id").is_not_null())
+    if known.is_empty():
+        pytest.skip("fixture has no uniquely bound controller and enemy FOW row")
+    roster = {
+        row["steam_id"]: row["hero_id"]
+        for row in demo.players.select("steam_id", "hero_id").to_dicts()
+    }
+    assert set(known["target_steam_id"].to_list()) <= set(roster)
+    assert all(
+        row["target_hero_id"] is None
+        or roster[row["target_steam_id"]] == row["target_hero_id"]
+        for row in known.select("target_steam_id", "target_hero_id").to_dicts()
+    )
+    by_pawn = known.group_by("target_entity_index", "target_entity_serial").agg(
+        pl.col("target_steam_id").n_unique().alias("steam_ids")
+    )
+    assert by_pawn["steam_ids"].max() == 1
 
 
 def test_selected_minimap_ticks_preserve_last_seen_history(demo: Demo) -> None:
