@@ -86,3 +86,41 @@ def test_existing_objective_rows_expose_mid_boss_health(demo: Demo) -> None:
         pytest.skip("fixture has no observed mid-boss entity")
     assert boss.select(pl.col("max_health").min()).item() > 0
     assert boss.filter(pl.col("health") > pl.col("max_health")).is_empty()
+
+
+def test_target_observations_keep_identity_metadata_and_null_hidden_payload(demo: Demo) -> None:
+    frame = demo.target_observations(ticks=[1])
+    assert set(frame.columns) == {
+        "tick", "observer_team", "target_class", "fow_class_raw", "target_team",
+        "target_entity_index", "target_entity_serial", "identity_known",
+        "fow_entry_present", "shown", "map_x", "map_y", "raw_health_byte",
+        "position_available", "health_byte_available", "observation_reason",
+        "rift_disabled", "rift_enable_state", "capture_active_known",
+        "capture_active", "rift_position_available", "rift_x", "rift_y", "rift_z",
+    }
+    assert frame.schema["target_entity_index"] == pl.Int32
+    assert frame.schema["target_entity_serial"] == pl.UInt32
+    assert frame.filter(~pl.col("identity_known")).is_empty()
+    assert frame.filter(
+        ~pl.col("shown").fill_null(False) & (
+            pl.col("map_x").is_not_null()
+            | pl.col("map_y").is_not_null()
+            | pl.col("raw_health_byte").is_not_null()
+        )
+    ).is_empty()
+    assert frame.filter(
+        ~pl.col("position_available")
+        & (pl.col("map_x").is_not_null() | pl.col("map_y").is_not_null())
+    ).is_empty()
+    assert frame.filter(
+        ~pl.col("health_byte_available") & pl.col("raw_health_byte").is_not_null()
+    ).is_empty()
+    if not frame.is_empty():
+        assert set(frame["target_class"].unique().to_list()) <= {
+            "CNPC_TrooperBoss", "CNPC_Boss_Tier2", "CCitadel_KothCashIn"
+        }
+
+
+def test_target_observations_reject_ticks_outside_demo(demo: Demo) -> None:
+    with pytest.raises(ValueError, match="within the demo tick range"):
+        demo.target_observations(ticks=[demo.total_ticks + 1])

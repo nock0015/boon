@@ -44,6 +44,7 @@ impl Demo {
         let load_world_ticks = needs(Dataset::WorldTicks);
         let load_kills = kill_cohort && self.cached_datasets[Dataset::Kills].is_none();
         let load_damage = needs(Dataset::Damage);
+        let load_resources = needs(Dataset::ResourceEvents);
         let load_flex_slots = needs(Dataset::FlexSlots);
         let load_ability_upgrades =
             controller_cohort && self.cached_datasets[Dataset::AbilityUpgrades].is_none();
@@ -69,6 +70,7 @@ impl Demo {
             && !load_world_ticks
             && !load_kills
             && !load_damage
+            && !load_resources
             && !load_flex_slots
             && !load_ability_upgrades
             && !load_item_purchases
@@ -122,6 +124,7 @@ impl Demo {
         let only_snapshots = !load_abilities
             && !load_kills
             && !load_damage
+            && !load_resources
             && !load_flex_slots
             && !load_ability_upgrades
             && !load_item_purchases
@@ -170,6 +173,7 @@ impl Demo {
         let need_events = load_abilities
             || load_kills
             || load_damage
+            || load_resources
             || load_sinners_sacrifice
             || load_flex_slots
             || load_item_purchases
@@ -185,6 +189,9 @@ impl Demo {
         if !self.always_events_scanned {
             event_types.insert(Msg::KEUserMsgGameOver as u32);
             event_types.insert(Msg::KEUserMsgBannedHeroes as u32);
+        }
+        if load_resources {
+            event_types.insert(Msg::KEUserMsgCurrencyChanged as u32);
         }
         if load_kills {
             event_types.insert(Msg::KEUserMsgHeroKilled as u32);
@@ -247,6 +254,7 @@ impl Demo {
         if load_abilities
             || load_kills
             || load_damage
+            || load_resources
             || load_sinners_sacrifice
             || load_mid_boss
             || load_active_modifiers
@@ -295,7 +303,22 @@ impl Demo {
                 class_names.push(n.as_str());
             }
         }
+        // Exact event endpoints can refer to any networked entity class. Keep
+        // their current identities, not a guessed class based on message codes.
+        let endpoint_classes: Vec<String> = if load_resources || load_damage {
+            self.parser
+                .parse_send_tables()
+                .map_err(to_py_err)?
+                .iter()
+                .map(|(name, _)| name.to_owned())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        class_names.extend(endpoint_classes.iter().map(String::as_str));
         let class_filter: std::collections::HashSet<&str> = class_names.into_iter().collect();
+        let mut resource_rows = Vec::new();
+        let mut resource_decode_error = None;
 
         // ── Kill / damage event collection ──
         struct RawEvent<T> {
@@ -308,6 +331,8 @@ impl Demo {
             event: RawEvent<boon_proto::proto::CCitadelUserMessageDamage>,
             victim_hero_id: i64,
             attacker_hero_id: i64,
+            attacker_endpoint: Option<(i32, u32, String)>,
+            victim_endpoint: Option<(i32, u32, String)>,
         }
         let mut raw_damage_events = Vec::new();
         let mut entity_to_hero: HashMap<i32, i64> = HashMap::new();
@@ -1700,6 +1725,63 @@ impl Demo {
                         collect_entity_data!(ctx);
 
                         for event in events {
+                            if load_resources
+                                && event.msg_type == Msg::KEUserMsgCurrencyChanged as u32
+                            {
+                                match boon_proto::proto::CCitadelUserMsgCurrencyChanged::decode(
+                                    event.payload.as_slice(),
+                                ) {
+                                    Ok(msg) => {
+                                        let ctrl = msg
+                                            .userid
+                                            .and_then(|v| v.checked_add(1))
+                                            .filter(|index| *index > 0)
+                                            .and_then(|index| ctx.entities().get(index))
+                                            .filter(|entity| {
+                                                entity.class_name.as_ref()
+                                                    == "CCitadelPlayerController"
+                                            });
+                                        let steam_key = ctx
+                                            .serializers()
+                                            .get("CCitadelPlayerController")
+                                            .and_then(|schema| {
+                                                schema.resolve_field_key("m_steamID")
+                                            });
+                                        let steam = ctrl.and_then(|entity| {
+                                            match entity.field_value(steam_key) {
+                                                Some(boon_parser::FieldValue::U64(value))
+                                                    if *value != 0 =>
+                                                {
+                                                    Some(*value)
+                                                }
+                                                _ => None,
+                                            }
+                                        });
+                                        let source = msg
+                                            .victim
+                                            .filter(|handle| *handle < 16777215)
+                                            .and_then(|handle| ctx.entities().get_by_handle(handle))
+                                            .map(|entity| {
+                                                (
+                                                    entity.index,
+                                                    entity.serial,
+                                                    entity.class_name.to_string(),
+                                                )
+                                            });
+                                        resource_rows.push(crate::resource_events::Row {
+                                            tick: event.tick,
+                                            sequence: resource_rows.len() as u64,
+                                            steam_id: steam,
+                                            controller_index: ctrl.map(|entity| entity.index),
+                                            source,
+                                            message: msg,
+                                        });
+                                    }
+                                    Err(error) => {
+                                        resource_decode_error = Some(error.to_string());
+                                    }
+                                }
+                            }
                             if load_kills && event.msg_type == Msg::KEUserMsgHeroKilled as u32 {
                                 raw_kill_events.push(RawEvent {
                                     tick: event.tick,
@@ -1786,7 +1868,28 @@ impl Demo {
                                                 hero_id(msg.entindex_attacker),
                                             )
                                         });
+                                    let endpoint = |index: Option<i32>| {
+                                        index.and_then(|index| ctx.entities().get(index)).map(
+                                            |entity| {
+                                                (
+                                                    entity.index,
+                                                    entity.serial,
+                                                    entity.class_name.to_string(),
+                                                )
+                                            },
+                                        )
+                                    };
+                                    let attacker_endpoint = message
+                                        .as_ref()
+                                        .ok()
+                                        .and_then(|msg| endpoint(msg.entindex_attacker));
+                                    let victim_endpoint = message
+                                        .as_ref()
+                                        .ok()
+                                        .and_then(|msg| endpoint(msg.entindex_victim));
                                     raw_damage_events.push(RawDamageEvent {
+                                        attacker_endpoint,
+                                        victim_endpoint,
                                         event: RawEvent {
                                             tick: event.tick,
                                             message,
@@ -2061,6 +2164,17 @@ impl Demo {
             self.cached_datasets[Dataset::Kills] = Some(df);
         }
 
+        if load_resources {
+            if let Some(error) = resource_decode_error {
+                return Err(DemoMessageError::new_err(format!(
+                    "Failed to decode CurrencyChanged event: {error}"
+                )));
+            }
+            self.cached_datasets[Dataset::ResourceEvents] = Some(
+                crate::resource_events::frame(&resource_rows)
+                    .map_err(|error| InvalidDemoError::new_err(error.to_string()))?,
+            );
+        }
         if load_damage {
             // Build damage rows with the hero identities captured at each event.
             let n = raw_damage_events.len();
@@ -2140,6 +2254,48 @@ impl Demo {
                 Column::new("victim_shield_new".into(), dmg_shield_new),
                 Column::new("victim_shield_max".into(), dmg_shield_max),
                 Column::new("server_tick".into(), dmg_server_tick),
+                Column::new(
+                    "attacker_entity_index".into(),
+                    raw_damage_events
+                        .iter()
+                        .map(|r| r.attacker_endpoint.as_ref().map(|e| e.0))
+                        .collect::<Vec<_>>(),
+                ),
+                Column::new(
+                    "attacker_entity_serial".into(),
+                    raw_damage_events
+                        .iter()
+                        .map(|r| r.attacker_endpoint.as_ref().map(|e| e.1))
+                        .collect::<Vec<_>>(),
+                ),
+                Column::new(
+                    "attacker_entity_class".into(),
+                    raw_damage_events
+                        .iter()
+                        .map(|r| r.attacker_endpoint.as_ref().map(|e| e.2.as_str()))
+                        .collect::<Vec<_>>(),
+                ),
+                Column::new(
+                    "victim_entity_index".into(),
+                    raw_damage_events
+                        .iter()
+                        .map(|r| r.victim_endpoint.as_ref().map(|e| e.0))
+                        .collect::<Vec<_>>(),
+                ),
+                Column::new(
+                    "victim_entity_serial".into(),
+                    raw_damage_events
+                        .iter()
+                        .map(|r| r.victim_endpoint.as_ref().map(|e| e.1))
+                        .collect::<Vec<_>>(),
+                ),
+                Column::new(
+                    "victim_entity_class".into(),
+                    raw_damage_events
+                        .iter()
+                        .map(|r| r.victim_endpoint.as_ref().map(|e| e.2.as_str()))
+                        .collect::<Vec<_>>(),
+                ),
             ])
             .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
             self.cached_datasets[Dataset::Damage] = Some(df);

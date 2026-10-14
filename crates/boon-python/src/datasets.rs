@@ -49,6 +49,7 @@ pub(super) enum Dataset {
     WorldTicks,
     Kills,
     Damage,
+    ResourceEvents,
     FlexSlots,
     ItemPurchases,
     Troopers,
@@ -64,7 +65,7 @@ pub(super) enum Dataset {
 }
 
 impl Dataset {
-    pub(super) const ALL: [Self; 22] = [
+    pub(super) const ALL: [Self; 23] = [
         Self::Abilities,
         Self::AbilityUpgrades,
         Self::AbilityTicks,
@@ -75,6 +76,7 @@ impl Dataset {
         Self::WorldTicks,
         Self::Kills,
         Self::Damage,
+        Self::ResourceEvents,
         Self::FlexSlots,
         Self::ItemPurchases,
         Self::Troopers,
@@ -101,6 +103,7 @@ impl Dataset {
             Self::WorldTicks => "world_ticks",
             Self::Kills => "kills",
             Self::Damage => "damage",
+            Self::ResourceEvents => "resource_events",
             Self::FlexSlots => "flex_slots",
             Self::ItemPurchases => "item_purchases",
             Self::Troopers => "troopers",

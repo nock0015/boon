@@ -10,6 +10,7 @@ from boon import Demo
 demo = Demo("match.dem", preload=False)
 players = demo.snapshots("player_ticks", seconds=1.0)
 enemy_icons = demo.enemy_minimap_ticks(every=64)
+targets = demo.target_observations(ticks=[187554, 188194])
 mid_boss_hp = demo.objectives.filter(
     demo.objectives["objective_type"] == "mid_boss"
 )
@@ -56,6 +57,39 @@ updated while scanning every tick, even when the output is sampled.
 The interpretation of FOW class code and index encoding should be checked
 against each demo build. `enemy_minimap_ticks()` does not claim direct
 line-of-sight visibility or use a player pawn's hidden world position.
+
+## Exact target observations
+
+`target_observations(ticks=...)` emits rows for the currently active Guardian,
+Walker, and Rift cash-in entities, paired with each recorded team minimap
+channel. `target_entity_index` and `target_entity_serial` identify the exact
+current entity lifetime and are metadata-only join keys. Keep them out of model
+features.
+
+Guardian and Walker minimap facts come only from a unique FOW row whose raw
+index resolves to one current active exact-class entity and whose recorded
+class code and target team agree. The decoder tests both possible index
+encodings; if they resolve to different entities, or the row/channel is
+ambiguous or incomplete, the fact is unknown. `shown` is nullable. `map_x`,
+`map_y`, and `raw_health_byte` are read only when the exact row is recorded as
+shown. The raw health byte has no verified fraction mapping. Server health and
+world coordinates for Guardians and Walkers are not exported.
+
+`target_class` contains the exact Boon entity class name. `fow_class_raw` is
+audit metadata retained with a uniquely joined FOW row; its interpretation must
+be qualified against each replay's source-patch provenance. The decoder does
+not infer that an engine build number is an archive patch. `fow_entry_present`,
+`identity_known`, `position_available`, and `health_byte_available` are audit/availability fields, not choice labels.
+
+Rift state is a documented public/global game rule. The method reads only the
+current cash-in entity's typed `m_bDisabled` and `m_nEnableState`, a boolean
+capture-active observation from the current positive-or-zero GameRules start
+field, and the current GameRules location when exactly one cash-in is active
+and the current capture clock is positive. It does not export raw timer values,
+scoring team, participant count, capture result, or future lifecycle rows.
+Missing values remain null. The current location and active flag describe the
+recorded global Rift state; they do not imply player attention, safety, or
+actionability.
 
 ## Mid-boss health
 

@@ -632,6 +632,17 @@ class Demo:
         """
         ...
 
+    def target_observations(self, *, ticks: Sequence[int]) -> pl.DataFrame:
+        """Exact-identity Guardian, Walker, and Rift observations at selected ticks.
+
+        Identity columns are metadata-only join keys. Objective FOW payload is
+        emitted only for uniquely matched shown icons; hidden or ambiguous facts
+        remain null. Guardian/Walker server health and world coordinates are
+        excluded. Current Rift fields include public capture state/location and
+        typed cash-in fields; no timers, participants, scoring team, or outcomes.
+        """
+        ...
+
     @property
     def player_ticks(self) -> pl.DataFrame:
         """Per-tick, per-player state as a Polars DataFrame.
@@ -759,6 +770,20 @@ class Demo:
             - **damage_flags** (*int*) -- Raw Valve damage flags.
             - **is_melee** (*bool*) -- Whether this is melee-typed damage (``citadel_type == 3``).
             - **melee_type** (*str | None*) -- ``"light"``, ``"heavy"``, or ``"other"`` for melee-typed damage; null otherwise.
+        """
+        ...
+
+    @property
+    def resource_events(self) -> pl.DataFrame:
+        """Recorded currency changes with source-time identities.
+
+        tick/sequence, nullable steam_id/controller_index/userid,
+        currency_type/currency_source/amount/new_value, victim_handle,
+        source_entity_index/source_entity_serial/source_entity_class,
+        source_x/source_y/source_z, ability_id and notification.
+        Currency source codes are raw, not EGoldSource summary IDs.
+        Spends and alternate ledgers remain separate recorded rows.
+        Missing recipient/source resolution remains null.
         """
         ...
 

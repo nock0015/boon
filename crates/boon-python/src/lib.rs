@@ -44,8 +44,10 @@ mod loader;
 mod minimap;
 mod names;
 mod player_states;
+mod resource_events;
 mod runtime;
 mod snapshots;
+mod target_observations;
 
 use datasets::*;
 use names::*;

@@ -76,6 +76,18 @@ impl Demo {
         self.dataset_frame(py, Dataset::Damage)
     }
 
+    /// Recorded currency changes, including spends and alternate ledgers.
+    ///
+    /// Raw currency_type/source codes are preserved, not guessed source labels.
+    /// userid resolves to controller index userid+1 only when a current player
+    /// controller with a nonzero Steam ID is present. The victim is a full entity
+    /// handle: index reuse never substitutes another serial. Missing resolution
+    /// stays null. No claim of last-hit ownership is made.
+    #[getter]
+    pub(crate) fn resource_events(&mut self, py: Python<'_>) -> PyResult<PyDataFrame> {
+        self.dataset_frame(py, Dataset::ResourceEvents)
+    }
+
     /// Flex slot unlock events as a Polars DataFrame.
     ///
     /// Columns: ``tick``, ``team_num``.

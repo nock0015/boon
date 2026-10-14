@@ -238,6 +238,42 @@ without a selector raises `ValueError`.
 Player rows always include `ammo_fraction` from the primary weapon's
 `m_flAmmoFrac`. Missing, invalid, or ambiguous values are null. This field uses no catalog. Alternate weapons and selected spells do not replace the primary gun.
 
+---
+
+#### `target_observations()`
+
+```python
+targets = demo.target_observations(ticks=[187554, 188194])
+```
+
+Return exact-identity Guardian (`CNPC_TrooperBoss`), Walker
+(`CNPC_Boss_Tier2`), and Rift cash-in (`CCitadel_KothCashIn`) observations at
+the selected replay ticks. The result has one row per active target and observer
+team (2 or 3). Entity index and serial columns are metadata-only join keys; do
+not use numerical identity values as model inputs.
+
+The minimap fields come only from the observer team's recorded
+`CCitadelTeam.m_vecFOWEntities` row. Boon resolves the raw index using both
+plausible encodings and accepts it only when one current active target matches
+the recorded class and target team. Ambiguous, missing, or incomplete joins
+remain unknown. `map_x`, `map_y`, and `raw_health_byte` are populated only when
+the exact icon row is recorded as shown. The health byte is unscaled. Guardian
+and Walker server health and world position are not included.
+
+Rift columns contain only current typed cash-in fields and a current public
+GameRules capture-active flag/location. The location is present only for one
+current cash-in with a positive current capture clock and a valid current
+location. The API does not export timers, participant state, scoring team,
+capture outcome, or future lifecycle summaries. The Rift public/global source
+scope follows the documented user-confirmed game rule in
+{doc}`replay-input-fields`.
+
+`target_class` contains the exact source entity class name, while
+`fow_class_raw` is audit metadata whose meaning is qualified against each
+replay's source-patch provenance. The decoder does not infer archive patch from
+engine build. Availability columns distinguish missing identity/FOW payload
+from recorded hidden icons.
+
 Set `data_version` to add these columns to `player_ticks`. Use a client version
 from `boon versions`. Boon downloads a missing version. This option runs extra
 stat and state queries at the selected ticks; include `player_ticks` in the request.
@@ -1663,3 +1699,31 @@ states, and deletion of an observed source ability for intrinsic effects.
 A table snapshot is not a new event. New applications can affect multiple players
 on the same tick. Missing evidence does not end an effect.
 The query uses local game data and downloads the latest data if none is installed.
+
+
+### Currency changes and exact damage endpoints
+
+`demo.resource_events` (also `demo.load("resource_events", "damage")`) returns
+one row per decoded CurrencyChanged message. `tick` is the enclosing command
+clock; `sequence` is the stable zero-based order in this table. `userid + 1`
+is admitted as a recipient only when that current entity is a player controller
+with a nonzero Steam ID. Missing resolution stays null.
+
+The message's `victim` is a full handle, unlike Damage's entity indexes.
+`source_entity_index`, `source_entity_serial` and `source_entity_class` describe
+only the exact matching current lifetime. A recycled slot with a different
+serial is never substituted. `source_x/y/z` preserve the optional reported
+message position, not a private server-state position. `victim_handle` preserves
+the raw handle even if resolution fails.
+
+`currency_source` is the raw message code, not the `EGoldSource` enum used by
+`summary()["gold_sources"]`. `currency_type` distinguishes ledgers. Retain spends,
+unknown codes and alternate-ledger rows; do not add every positive delta to a
+soul total or infer last-hit ownership. The existing summary tables remain
+periodic cumulative audit/target data, not exact soul-gain timestamps.
+
+Damage additionally exposes nullable `attacker_entity_index/serial/class` and
+`victim_entity_index/serial/class` resolved at the event's command tick. Existing
+legacy damage columns retain their prior behavior. Requesting these datasets
+requires entity state for endpoint classes and can cost more decoding work than
+reading message amounts alone. Compatible requested datasets share one pass.
