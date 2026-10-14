@@ -1760,3 +1760,24 @@ The source ticks, entity lifetimes, individual fields, floating-point bits and
 existing explicit animation-field exclusion are unchanged. This is recorded
 server evidence; consumers must still apply their team-knowledge policy before
 using it as model input. The existing gzip-file method remains supported.
+
+### Internal bounded restore helpers
+
+`boon._boon.EvidenceIndex` validates the current
+`boon-entity-evidence-v1` byte stream in bounded batches. `push(bytes)` returns
+completed zlib-compressed record blocks with source-tick bounds, cumulative
+record counts, and exact index/serial membership. `finish()` requires a valid
+completion footer and flushes the final block. `metadata()` is available only
+after successful completion. Parsing, validation, and compression release the
+Python interpreter lock. Current streams must declare the rendering-field
+exclusion; legacy all-fields archives continue through the lab's reference
+importer so their field order and serialization remain unchanged.
+
+`boon._boon.ZiplineViews` maintains individual normalized zipline records by
+index and serial. `update` and `remove` invalidate cached views on exact input
+changes; `project(tick)` serializes the current public node positions, ownership,
+lane, connections, and frontier evidence outside the interpreter lock. It does
+not classify minion riders or merge nodes. The caller creates independent team
+containers. Source/fact insertion order is retained because pretraining's
+masked-fact sampling consumes that order. Other team-knowledge projections
+remain in the source-qualified lab implementation.

@@ -39,6 +39,8 @@ fn to_py_err(e: boon_parser::Error) -> PyErr {
 mod api;
 mod datasets;
 mod entity_evidence;
+mod restore_index;
+mod restore_ziplines;
 mod getters;
 mod hero_stats;
 mod loader;
@@ -100,6 +102,8 @@ struct Demo {
 #[pymodule]
 fn _boon(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Demo>()?;
+    m.add_class::<restore_index::EvidenceIndex>()?;
+    m.add_class::<restore_ziplines::ZiplineViews>()?;
     m.add_function(wrap_pyfunction!(_read_catalog_names, m)?)?;
     m.add_function(wrap_pyfunction!(team_names, m)?)?;
     m.add_function(wrap_pyfunction!(game_mode_names, m)?)?;

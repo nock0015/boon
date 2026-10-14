@@ -13,7 +13,8 @@ name = "_boon"
 crate-type = ["cdylib"]
 
 [dependencies]
-serde_json.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 flate2 = "1.1"
 boon_parser = { path = "../boon", package = "boon-deadlock" }
 boon-proto = { workspace = true }
