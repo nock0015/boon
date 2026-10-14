@@ -88,6 +88,12 @@ impl Demo {
         self.dataset_frame(py, Dataset::ResourceEvents)
     }
 
+    /// Explicit bag pickup notifications, kept independently of currency receipts.
+    #[getter]
+    pub(crate) fn soul_bag_pickups(&mut self, py: Python<'_>) -> PyResult<PyDataFrame> {
+        self.dataset_frame(py, Dataset::SoulBagPickups)
+    }
+
     /// Flex slot unlock events as a Polars DataFrame.
     ///
     /// Columns: ``tick``, ``team_num``.

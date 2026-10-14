@@ -776,6 +776,11 @@ class Demo:
         ...
 
     @property
+    def soul_bag_pickups(self) -> pl.DataFrame:
+        """Original timestamped bag pickup notifications and player handles."""
+        ...
+
+    @property
     def resource_events(self) -> pl.DataFrame:
         """Recorded currency changes with source-time identities.
 

@@ -1727,3 +1727,19 @@ Damage additionally exposes nullable `attacker_entity_index/serial/class` and
 legacy damage columns retain their prior behavior. Requesting these datasets
 requires entity state for endpoint classes and can cost more decoding work than
 reading message amounts alone. Compatible requested datasets share one pass.
+
+### Soul bag pickup notifications
+
+`demo.soul_bag_pickups` retains every `SoulBagPickup` message independently:
+`tick`, `pickup_player`, `victim_player` and `killfeed_gold`. Player values are
+full generation-bearing handles, not Steam IDs. Requesting this dataset or
+`resource_events` loads both in one shared pass.
+
+Currency rows also expose `recipient_pawn_handle`, `soul_bag_status`,
+`bag_pickup_player`, `bag_victim_player` and `bag_gold`. `matched` requires an
+original same-tick notification with the same recipient handle and positive
+amount, with no duplicate notification or receipt in that currency ledger.
+`unresolved` retains ambiguous/missing identity evidence; `no-matching-notification`
+means no compatible notification was recorded, not proof that the source was
+not a bag. Multiple ledgers retain separate rows. No additional currency gain
+is generated from the notification. The native currency code stays unchanged.

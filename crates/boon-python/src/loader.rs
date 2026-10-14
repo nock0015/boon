@@ -56,7 +56,10 @@ impl Demo {
         let load_world_ticks = needs(Dataset::WorldTicks);
         let load_kills = kill_cohort && self.cached_datasets[Dataset::Kills].is_none();
         let load_damage = needs(Dataset::Damage);
-        let load_resources = needs(Dataset::ResourceEvents);
+        let load_resources = (requested(Dataset::ResourceEvents)
+            || requested(Dataset::SoulBagPickups))
+            && (self.cached_datasets[Dataset::ResourceEvents].is_none()
+                || self.cached_datasets[Dataset::SoulBagPickups].is_none());
         let load_flex_slots = needs(Dataset::FlexSlots);
         let load_ability_upgrades =
             controller_cohort && self.cached_datasets[Dataset::AbilityUpgrades].is_none();
@@ -204,6 +207,7 @@ impl Demo {
         }
         if load_resources {
             event_types.insert(Msg::KEUserMsgCurrencyChanged as u32);
+            event_types.insert(Msg::KEUserMsgSoulBagPickup as u32);
         }
         if load_kills {
             event_types.insert(Msg::KEUserMsgHeroKilled as u32);
@@ -330,6 +334,7 @@ impl Demo {
         class_names.extend(endpoint_classes.iter().map(String::as_str));
         let class_filter: std::collections::HashSet<&str> = class_names.into_iter().collect();
         let mut resource_rows = Vec::new();
+        let mut soul_bag_rows = Vec::new();
         let mut resource_decode_error = None;
 
         // ── Kill / damage event collection ──
@@ -1740,6 +1745,21 @@ impl Demo {
 
                         for event in events {
                             if load_resources
+                                && event.msg_type == Msg::KEUserMsgSoulBagPickup as u32
+                            {
+                                match boon_proto::proto::CCitadelUserMsgSoulBagPickup::decode(
+                                    event.payload.as_slice(),
+                                ) {
+                                    Ok(message) => {
+                                        soul_bag_rows.push(crate::resource_events::BagRow {
+                                            tick: event.tick,
+                                            message,
+                                        })
+                                    }
+                                    Err(error) => resource_decode_error = Some(error.to_string()),
+                                }
+                            }
+                            if load_resources
                                 && event.msg_type == Msg::KEUserMsgCurrencyChanged as u32
                             {
                                 match boon_proto::proto::CCitadelUserMsgCurrencyChanged::decode(
@@ -1788,6 +1808,18 @@ impl Demo {
                                             steam_id: steam,
                                             controller_index: ctrl.map(|entity| entity.index),
                                             source,
+                                            pawn_handle: ctrl.and_then(|entity| {
+                                                let schema = ctx
+                                                    .serializers()
+                                                    .get("CCitadelPlayerController")?;
+                                                crate::resource_events::recorded_handle(
+                                                    entity.field_value(
+                                                        schema.resolve_field_key("m_hPawn"),
+                                                    ),
+                                                )
+                                            }),
+                                            bag: None,
+                                            bag_status: "unresolved",
                                             message: msg,
                                         });
                                     }
@@ -2181,9 +2213,14 @@ impl Demo {
         if load_resources {
             if let Some(error) = resource_decode_error {
                 return Err(DemoMessageError::new_err(format!(
-                    "Failed to decode CurrencyChanged event: {error}"
+                    "Failed to decode currency/bag event: {error}"
                 )));
             }
+            crate::resource_events::link_bags(&mut resource_rows, &soul_bag_rows);
+            self.cached_datasets[Dataset::SoulBagPickups] = Some(
+                crate::resource_events::bag_frame(&soul_bag_rows)
+                    .map_err(|error| InvalidDemoError::new_err(error.to_string()))?,
+            );
             self.cached_datasets[Dataset::ResourceEvents] = Some(
                 crate::resource_events::frame(&resource_rows)
                     .map_err(|error| InvalidDemoError::new_err(error.to_string()))?,
@@ -2559,9 +2596,21 @@ mod catalog_version_tests {
     use super::replay_catalog_version;
     #[test]
     fn modifiers_require_the_recorded_client_version() {
-        assert_eq!(replay_catalog_version(Some("/opt/citadel_v6774/citadel")), Some("6774".into()));
-        assert_eq!(replay_catalog_version(Some(r"C:\games\citadel_v6774\citadel")), Some("6774".into()));
-        for path in [None, Some("citadel"), Some("citadel_vbad"), Some("citadel_v"), Some("citadel_v6774/citadel_v6779")] {
+        assert_eq!(
+            replay_catalog_version(Some("/opt/citadel_v6774/citadel")),
+            Some("6774".into())
+        );
+        assert_eq!(
+            replay_catalog_version(Some(r"C:\games\citadel_v6774\citadel")),
+            Some("6774".into())
+        );
+        for path in [
+            None,
+            Some("citadel"),
+            Some("citadel_vbad"),
+            Some("citadel_v"),
+            Some("citadel_v6774/citadel_v6779"),
+        ] {
             assert_eq!(replay_catalog_version(path), None);
         }
     }
