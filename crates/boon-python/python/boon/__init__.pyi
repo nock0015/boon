@@ -1,4 +1,4 @@
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 import polars as pl
@@ -101,6 +101,7 @@ def lifestate_names() -> dict[int, str]:
 
 class Demo:
     def write_entity_evidence(self, *, output_path: str | Path) -> int: ...
+    def stream_entity_evidence(self, *, sink: Callable[[bytes], object]) -> int: ...
 
     """A Deadlock demo file.
 

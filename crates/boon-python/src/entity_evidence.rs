@@ -93,19 +93,51 @@ impl Demo {
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         let result=py.detach(|| {
             let mut writer=GzEncoder::new(BufWriter::new(file),Compression::fast());
+            let count = self.write_evidence_to(&mut writer)?;
+            writer.finish().and_then(|mut output|output.flush())
+                .map_err(|e|pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+            Ok(count)
+        });
+        if result.is_err() {
+            let _ = std::fs::remove_file(output_path);
+        }
+        result
+    }
+    /// Deliver complete newline-delimited records in bounded byte batches.
+    /// The callback provides backpressure; no intermediate compressed file.
+    #[pyo3(signature = (*, sink))]
+    pub(crate) fn stream_entity_evidence(&self, py: Python<'_>, sink: Py<PyAny>) -> PyResult<u64> {
+        py.detach(|| {
+            let mut writer = BufWriter::with_capacity(256 * 1024, EvidenceSink(sink));
+            self.write_evidence_to(&mut writer)
+        })
+    }
+
+}
+
+struct EvidenceSink(Py<PyAny>);
+impl Write for EvidenceSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        Python::attach(|py| self.0.call1(py, (pyo3::types::PyBytes::new(py, bytes),)))
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+impl Demo {
+    fn write_evidence_to(&self, mut writer: impl Write) -> PyResult<u64> {
             line(&mut writer,&json!({"schema":"boon-entity-evidence-v1","kind":"header",
                 "scope":"recorded-server-state","clock":"source-demo-tick","granularity":"end-of-source-tick",
                 "allDecodedFields":false,"excludedFieldPrefixes":[EXCLUDED_FIELD_PREFIX],"averaging":false,"encoding":"entity-field-deltas",
                 "sourcePath":self.path.to_string_lossy()}))
                 .map_err(|e|pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-            let mut failure=None;let mut count=0u64;let mut first=true;
+            let mut count=0u64;let mut first=true;
             // Only current entity states are retained, never the replay timeline.
             let mut previous=HashMap::<(i32,u32),HashMap<u64,FieldValue>>::new();
             let mut names=HashMap::<(i32,u64),Option<String>>::new();
             let started=std::time::Instant::now();
             let mut last_progress=started;
-            self.parser.run_to_end(|ctx| {
-                if failure.is_some(){return;}
+            self.parser.try_run_to_end(|ctx| {
                 let mut identities=BTreeMap::new();
                 if first {
                     for (_,entity) in ctx.entities().iter(){identities.insert((entity.index,entity.serial),entity.class_name.to_string());}
@@ -141,7 +173,7 @@ impl Demo {
                         json!({"kind":"absent","sequence":count,"tick":ctx.tick(),"entity_index":index,
                             "entity_serial":serial,"entity_class":class_name,"deleted":deleted})
                     };
-                    if let Err(error)=line(&mut writer,&record){failure=Some(error.to_string());return;}
+                    line(&mut writer,&record)?;
                     count+=1;
                 }
                 if last_progress.elapsed().as_secs()>=5 {
@@ -149,18 +181,11 @@ impl Demo {
                         "sourceTick":ctx.tick(),"records":count,"elapsedSeconds":started.elapsed().as_secs()}));
                     last_progress=std::time::Instant::now();
                 }
+                Ok(())
             }).map_err(to_py_err)?;
-            if let Some(error)=failure{return Err(pyo3::exceptions::PyIOError::new_err(error));}
             line(&mut writer,&json!({"kind":"complete","records":count}))
-                .and_then(|_|writer.try_finish()).map_err(|e|pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-            writer.finish().and_then(|mut output|output.flush())
-                .map_err(|e|pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+                .and_then(|_|writer.flush()).map_err(|e|pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
             Ok(count)
-        });
-        if result.is_err() {
-            let _ = std::fs::remove_file(output_path);
-        }
-        result
     }
 }
 

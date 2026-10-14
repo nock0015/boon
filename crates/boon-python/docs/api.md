@@ -1743,3 +1743,20 @@ amount, with no duplicate notification or receipt in that currency ledger.
 means no compatible notification was recorded, not proof that the source was
 not a bag. Multiple ledgers retain separate rows. No additional currency gain
 is generated from the notification. The native currency code stays unchanged.
+
+
+### Streaming individual entity evidence
+
+`demo.stream_entity_evidence(sink=consume_bytes)` sends the same typed JSONL
+header, ordered state/change/absence records, and completion footer as
+`write_entity_evidence(output_path=...)`, without an intermediate gzip file.
+The callback receives byte batches through a 256 KiB buffer; a batch boundary
+need not be a line or UTF-8 character boundary. Process or enqueue each batch
+before returning to apply backpressure. An exception from the callback aborts
+replay decoding immediately and is reported as an I/O error. An interrupted
+stream is not a complete replay and must not be committed as one.
+
+The source ticks, entity lifetimes, individual fields, floating-point bits and
+existing explicit animation-field exclusion are unchanged. This is recorded
+server evidence; consumers must still apply their team-knowledge policy before
+using it as model input. The existing gzip-file method remains supported.
