@@ -803,6 +803,7 @@ pub(super) struct TrCols {
     pub(super) y: Vec<f32>,
     pub(super) z: Vec<f32>,
     pub(super) entity_id: Vec<i32>,
+    pub(super) entity_serial: Vec<u32>,
 }
 
 impl TrCols {
@@ -838,6 +839,7 @@ impl TrCols {
             self.y.push(y);
             self.z.push(z);
             self.entity_id.push(idx);
+            self.entity_serial.push(e.serial);
         }
     }
 
@@ -853,6 +855,7 @@ impl TrCols {
             numeric_column("y", self.y),
             numeric_column("z", self.z),
             numeric_column("entity_id", self.entity_id),
+            numeric_column("entity_serial", self.entity_serial),
         ])
         .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))
     }

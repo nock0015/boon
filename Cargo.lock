@@ -310,6 +310,7 @@ version = "0.15.0"
 dependencies = [
  "boon-deadlock",
  "boon-proto",
+ "flate2",
  "polars",
  "prost",
  "pyo3",

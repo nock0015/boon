@@ -3,6 +3,18 @@ use boon_parser::world_position;
 
 use crate::*;
 
+fn replay_catalog_version(directory: Option<&str>) -> Option<String> {
+    let mut versions = std::collections::BTreeSet::new();
+    for part in directory?.split(['/', '\\']) {
+        if let Some(version) = part.strip_prefix("citadel_v") {
+            if !version.is_empty() && version.bytes().all(|c| c.is_ascii_digit()) {
+                versions.insert(version.to_owned());
+            }
+        }
+    }
+    (versions.len() == 1).then(|| versions.into_iter().next().unwrap())
+}
+
 #[pymethods]
 impl Demo {
     /// Load and cache one or more datasets using compatible parser passes.
@@ -164,7 +176,7 @@ impl Demo {
             })?;
         }
 
-        let game_directory = if load_item_purchases {
+        let game_directory = if load_item_purchases || load_active_modifiers || load_urn {
             self.parser.file_header().map_err(to_py_err)?.game_directory
         } else {
             None
@@ -547,7 +559,9 @@ impl Demo {
         }
         let mut am_prev: HashMap<u32, CachedMod> = HashMap::new();
         let (mut am_state, mut urn_state) = if load_active_modifiers || load_urn {
-            let directory = boon_parser::data::catalog_dir(None)
+            let version = replay_catalog_version(game_directory.as_deref()).ok_or_else(||
+                InvalidDemoError::new_err("Active modifier rules require a unique recorded client version; no latest-version catalog was substituted"))?;
+            let directory = boon_parser::data::catalog_dir(Some(&version))
                 .map_err(|error| InvalidDemoError::new_err(error.to_string()))?;
             let catalog = boon_parser::hero_stats::StatCatalog::from_directory(&directory)
                 .map_err(|error| InvalidDemoError::new_err(error.to_string()))?;
@@ -2537,5 +2551,18 @@ impl Demo {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod catalog_version_tests {
+    use super::replay_catalog_version;
+    #[test]
+    fn modifiers_require_the_recorded_client_version() {
+        assert_eq!(replay_catalog_version(Some("/opt/citadel_v6774/citadel")), Some("6774".into()));
+        assert_eq!(replay_catalog_version(Some(r"C:\games\citadel_v6774\citadel")), Some("6774".into()));
+        for path in [None, Some("citadel"), Some("citadel_vbad"), Some("citadel_v"), Some("citadel_v6774/citadel_v6779")] {
+            assert_eq!(replay_catalog_version(path), None);
+        }
     }
 }

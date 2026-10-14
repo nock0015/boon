@@ -100,6 +100,8 @@ def lifestate_names() -> dict[int, str]:
     ...
 
 class Demo:
+    def write_entity_evidence(self, *, output_path: str | Path) -> int: ...
+
     """A Deadlock demo file.
 
     Args:
