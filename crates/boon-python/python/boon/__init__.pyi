@@ -1,4 +1,4 @@
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 import polars as pl
@@ -100,6 +100,9 @@ def lifestate_names() -> dict[int, str]:
     ...
 
 class Demo:
+    def write_entity_evidence(self, *, output_path: str | Path) -> int: ...
+    def stream_entity_evidence(self, *, sink: Callable[[bytes], object]) -> int: ...
+
     """A Deadlock demo file.
 
     Args:
@@ -617,6 +620,32 @@ class Demo:
         """
         ...
 
+    def enemy_minimap_ticks(
+        self, *, ticks: Sequence[int] | None = None, every: int | None = None
+    ) -> pl.DataFrame:
+        """Team-specific enemy hero minimap observations from replay FOW state.
+
+        `observer_team` selects the team's shared map channel. `visible_on_map`
+        is directly recorded; `map_x` and `map_y` are native byte coordinates
+        only for shown icons. `last_seen_*` is carried from the last shown row
+        of the same resolved pawn lifetime. Unbound rows retain their raw FOW
+        entity index and leave identity and last-seen columns null.
+        `target_steam_id` is present only when one active controller with a
+        recorded Steam ID points to that exact pawn lifetime.
+        """
+        ...
+
+    def target_observations(self, *, ticks: Sequence[int]) -> pl.DataFrame:
+        """Exact-identity Guardian, Walker, and Rift observations at selected ticks.
+
+        Identity columns are metadata-only join keys. Objective FOW payload is
+        emitted only for uniquely matched shown icons; hidden or ambiguous facts
+        remain null. Guardian/Walker server health and world coordinates are
+        excluded. Current Rift fields include public capture state/location and
+        typed cash-in fields; no timers, participants, scoring team, or outcomes.
+        """
+        ...
+
     @property
     def player_ticks(self) -> pl.DataFrame:
         """Per-tick, per-player state as a Polars DataFrame.
@@ -631,6 +660,8 @@ class Demo:
             - **tick** (*int*) -- The game tick.
             - **steam_id** (*int, nullable*) -- Steam account ID (UInt64).
             - **hero_id** (*int*) -- The player's hero ID.
+            - **boon_count** (*int, nullable*) -- Directly recorded boon count, when present in the replay schema.
+            - **upgrade_ids** (*list[int], nullable*) -- Complete current controller upgrade-token vector; classify item tokens with matching game data. Null means unavailable or undecodable.
             - **ammo_fraction** (*float, nullable*) -- Recorded primary-gun ammo fraction.
               Use snapshots(data_version=...) to calculate ammo and max_ammo.
             - **x** (*float*) -- Player X position.
@@ -746,6 +777,25 @@ class Demo:
         ...
 
     @property
+    def soul_bag_pickups(self) -> pl.DataFrame:
+        """Original timestamped bag pickup notifications and player handles."""
+        ...
+
+    @property
+    def resource_events(self) -> pl.DataFrame:
+        """Recorded currency changes with source-time identities.
+
+        tick/sequence, nullable steam_id/controller_index/userid,
+        currency_type/currency_source/amount/new_value, victim_handle,
+        source_entity_index/source_entity_serial/source_entity_class,
+        source_x/source_y/source_z, ability_id and notification.
+        Currency source codes are raw, not EGoldSource summary IDs.
+        Spends and alternate ledgers remain separate recorded rows.
+        Missing recipient/source resolution remains null.
+        """
+        ...
+
+    @property
     def flex_slots(self) -> pl.DataFrame:
         """Flex slot unlock events as a Polars DataFrame.
 
@@ -847,6 +897,7 @@ class Demo:
             - **y** (*float*) -- Y position.
             - **z** (*float*) -- Z position.
             - **entity_id** (*int*) -- Entity index (stable per structure across ticks).
+            - **entity_serial** (*int*) -- Entity lifetime serial; pair with entity_id to distinguish slot reuse.
         """
         ...
 

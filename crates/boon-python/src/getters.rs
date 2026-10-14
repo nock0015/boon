@@ -5,7 +5,11 @@ impl Demo {
     /// Per-tick, per-player state as a Polars DataFrame.
     ///
     /// Records position, health, barrier, combat timers,
-    /// kills, deaths, and net worth for each recorded player and tick.
+    /// kills, deaths, net worth, optional directly recorded boon count, and
+    /// the controller's complete current upgrade-token vector. `upgrade_ids`
+    /// is null when that vector cannot be decoded; an empty list means the
+    /// source explicitly records zero entries. Classify tokens with the
+    /// matching game-data catalog to select purchased items.
     /// Boon loads this dataset on first access.
     #[getter]
     pub(crate) fn player_ticks(&mut self, py: Python<'_>) -> PyResult<PyDataFrame> {
@@ -72,6 +76,24 @@ impl Demo {
         self.dataset_frame(py, Dataset::Damage)
     }
 
+    /// Recorded currency changes, including spends and alternate ledgers.
+    ///
+    /// Raw currency_type/source codes are preserved, not guessed source labels.
+    /// userid resolves to controller index userid+1 only when a current player
+    /// controller with a nonzero Steam ID is present. The victim is a full entity
+    /// handle: index reuse never substitutes another serial. Missing resolution
+    /// stays null. No claim of last-hit ownership is made.
+    #[getter]
+    pub(crate) fn resource_events(&mut self, py: Python<'_>) -> PyResult<PyDataFrame> {
+        self.dataset_frame(py, Dataset::ResourceEvents)
+    }
+
+    /// Explicit bag pickup notifications, kept independently of currency receipts.
+    #[getter]
+    pub(crate) fn soul_bag_pickups(&mut self, py: Python<'_>) -> PyResult<PyDataFrame> {
+        self.dataset_frame(py, Dataset::SoulBagPickups)
+    }
+
     /// Flex slot unlock events as a Polars DataFrame.
     ///
     /// Columns: ``tick``, ``team_num``.
@@ -120,7 +142,7 @@ impl Demo {
 
     /// Objective health state changes as a Polars DataFrame.
     ///
-    /// Columns: ``tick``, ``objective_type``, ``team_num``, ``lane``, ``health``, ``max_health``, ``phase``, ``x``, ``y``, ``z``, ``entity_id``.
+    /// Columns: ``tick``, ``objective_type``, ``team_num``, ``lane``, ``health``, ``max_health``, ``phase``, ``x``, ``y``, ``z``, ``entity_id``, ``entity_serial``.
     /// Emits a row when an objective's health or max_health changes.
     /// Boon loads this dataset on first access.
     #[getter]

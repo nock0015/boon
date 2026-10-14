@@ -238,6 +238,42 @@ without a selector raises `ValueError`.
 Player rows always include `ammo_fraction` from the primary weapon's
 `m_flAmmoFrac`. Missing, invalid, or ambiguous values are null. This field uses no catalog. Alternate weapons and selected spells do not replace the primary gun.
 
+---
+
+#### `target_observations()`
+
+```python
+targets = demo.target_observations(ticks=[187554, 188194])
+```
+
+Return exact-identity Guardian (`CNPC_TrooperBoss`), Walker
+(`CNPC_Boss_Tier2`), and Rift cash-in (`CCitadel_KothCashIn`) observations at
+the selected replay ticks. The result has one row per active target and observer
+team (2 or 3). Entity index and serial columns are metadata-only join keys; do
+not use numerical identity values as model inputs.
+
+The minimap fields come only from the observer team's recorded
+`CCitadelTeam.m_vecFOWEntities` row. Boon resolves the raw index using both
+plausible encodings and accepts it only when one current active target matches
+the recorded class and target team. Ambiguous, missing, or incomplete joins
+remain unknown. `map_x`, `map_y`, and `raw_health_byte` are populated only when
+the exact icon row is recorded as shown. The health byte is unscaled. Guardian
+and Walker server health and world position are not included.
+
+Rift columns contain only current typed cash-in fields and a current public
+GameRules capture-active flag/location. The location is present only for one
+current cash-in with a positive current capture clock and a valid current
+location. The API does not export timers, participant state, scoring team,
+capture outcome, or future lifecycle summaries. The Rift public/global source
+scope follows the documented user-confirmed game rule in
+{doc}`replay-input-fields`.
+
+`target_class` contains the exact source entity class name, while
+`fow_class_raw` is audit metadata whose meaning is qualified against each
+replay's source-patch provenance. The decoder does not infer archive patch from
+engine build. Availability columns distinguish missing identity/FOW payload
+from recorded hidden icons.
+
 Set `data_version` to add these columns to `player_ticks`. Use a client version
 from `boon versions`. Boon downloads a missing version. This option runs extra
 stat and state queries at the selected ticks; include `player_ticks` in the request.
@@ -1663,3 +1699,122 @@ states, and deletion of an observed source ability for intrinsic effects.
 A table snapshot is not a new event. New applications can affect multiple players
 on the same tick. Missing evidence does not end an effect.
 The query uses local game data and downloads the latest data if none is installed.
+
+
+### Currency changes and exact damage endpoints
+
+`demo.resource_events` (also `demo.load("resource_events", "damage")`) returns
+one row per decoded CurrencyChanged message. `tick` is the enclosing command
+clock; `sequence` is the stable zero-based order in this table. `userid + 1`
+is admitted as a recipient only when that current entity is a player controller
+with a nonzero Steam ID. Missing resolution stays null.
+
+The message's `victim` is a full handle, unlike Damage's entity indexes.
+`source_entity_index`, `source_entity_serial` and `source_entity_class` describe
+only the exact matching current lifetime. A recycled slot with a different
+serial is never substituted. `source_x/y/z` preserve the optional reported
+message position, not a private server-state position. `victim_handle` preserves
+the raw handle even if resolution fails.
+
+`currency_source` is the raw message code, not the `EGoldSource` enum used by
+`summary()["gold_sources"]`. `currency_type` distinguishes ledgers. Retain spends,
+unknown codes and alternate-ledger rows; do not add every positive delta to a
+soul total or infer last-hit ownership. The existing summary tables remain
+periodic cumulative audit/target data, not exact soul-gain timestamps.
+
+Damage additionally exposes nullable `attacker_entity_index/serial/class` and
+`victim_entity_index/serial/class` resolved at the event's command tick. Existing
+legacy damage columns retain their prior behavior. Requesting these datasets
+requires entity state for endpoint classes and can cost more decoding work than
+reading message amounts alone. Compatible requested datasets share one pass.
+
+### Soul bag pickup notifications
+
+`demo.soul_bag_pickups` retains every `SoulBagPickup` message independently:
+`tick`, `pickup_player`, `victim_player` and `killfeed_gold`. Player values are
+full generation-bearing handles, not Steam IDs. Requesting this dataset or
+`resource_events` loads both in one shared pass.
+
+Currency rows also expose `recipient_pawn_handle`, `soul_bag_status`,
+`bag_pickup_player`, `bag_victim_player` and `bag_gold`. `matched` requires an
+original same-tick notification with the same recipient handle and positive
+amount, with no duplicate notification or receipt in that currency ledger.
+`unresolved` retains ambiguous/missing identity evidence; `no-matching-notification`
+means no compatible notification was recorded, not proof that the source was
+not a bag. Multiple ledgers retain separate rows. No additional currency gain
+is generated from the notification. The native currency code stays unchanged.
+
+
+### Streaming individual entity evidence
+
+`demo.stream_entity_evidence(sink=consume_bytes)` sends the same typed JSONL
+header, ordered state/change/absence records, and completion footer as
+`write_entity_evidence(output_path=...)`, without an intermediate gzip file.
+The callback receives byte batches through a 256 KiB buffer; a batch boundary
+need not be a line or UTF-8 character boundary. Process or enqueue each batch
+before returning to apply backpressure. An exception from the callback aborts
+replay decoding immediately and is reported as an I/O error. An interrupted
+stream is not a complete replay and must not be committed as one.
+
+The source ticks, entity lifetimes, individual fields, floating-point bits and
+existing explicit animation-field exclusion are unchanged. This is recorded
+server evidence; consumers must still apply their team-knowledge policy before
+using it as model input. The existing gzip-file method remains supported.
+
+### Internal bounded restore helpers
+
+`boon._boon.EvidenceIndex` validates the current
+`boon-entity-evidence-v1` byte stream in bounded batches. `push(bytes)` returns
+completed zlib-compressed record blocks with source-tick bounds, cumulative
+record counts, and exact index/serial membership. `finish()` requires a valid
+completion footer and flushes the final block. `metadata()` is available only
+after successful completion. Parsing, validation, and compression release the
+Python interpreter lock. Current streams must declare the rendering-field
+exclusion; legacy all-fields archives continue through the lab's reference
+importer so their field order and serialization remain unchanged.
+
+`boon._boon.ZiplineViews` maintains individual normalized zipline records by
+index and serial. `update` and `remove` invalidate cached views on exact input
+changes; `project(tick)` serializes the current public node positions, ownership,
+lane, connections, and frontier evidence outside the interpreter lock. It does
+not classify minion riders or merge nodes. The caller creates independent team
+containers. Source/fact insertion order is retained because pretraining's
+masked-fact sampling consumes that order. Other team-knowledge projections
+remain in the source-qualified lab implementation.
+
+### Internal restore team-view projection
+
+`boon._boon.KnownViews` implements the complete existing team-known entity
+projection over bounded, validated evidence blocks. `feed(bytes)` accepts one
+decompressed archive block; `advance(source_tick)` applies only records through
+that frame and retains the first future record. Another block is accepted only
+when the pending block is consumed. `project(source_tick, match_seconds)` returns
+a compressed team-view payload and accumulates coverage/exclusion counters.
+Normalization, alias-owner order, controller/pawn identity, independent team
+visibility and last-seen memory, public objective HP/life, public camp markers and
+timers, zipline ownership/connections, individual stat contributions, inventories,
+AP upgrades, Rift fractions, and owned ability state follow the Python reference.
+No activity labels or team knowledge are inferred from hidden state.
+
+The constructor receives the existing Python team's roster, pinned display-only
+hero catalog, and exact-version minimap class catalog. `apply_json`, `at_json`,
+and `set_classes` support differential checks against the reference; they are
+internal helpers, not a replacement public replay API. `statistics()` reports
+measured frame/node/coverage/exclusion counts. Parsing, state updates, projection,
+and compression release Python's interpreter lock. SQLite writes, cancellation
+between bounded blocks/frames, and progress reporting remain in Python.
+
+Individual field/fact insertion order and exact f64 round-tripping are preserved.
+JSON escaping and compressed bytes may differ while decoded values and order
+remain identical. The original indexed evidence bytes are retained unchanged.
+
+For restore jobs, `submit(tick, time)` and `finish()` provide a bounded compression
+pipeline. With a thread budget of at least two, one persistent native worker
+compresses the previous snapshot while the coordinator prepares the next one.
+Only one compression request may be in flight; results remain in source order,
+and `finish()` drains the final result and joins the worker. A one-thread budget
+uses synchronous compression. The worker never reads or mutates entity/visibility
+state. `timings()` separates block parsing, state application, view preparation,
+coverage, JSON encoding, compression, and waiting for compression. Overlapping
+component times are not additive wall time. Pipeline timings are diagnostics,
+not persisted model inputs or cache metadata.

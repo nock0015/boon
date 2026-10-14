@@ -89,6 +89,15 @@ impl Parser {
         Ok(())
     }
 
+    /// Parse with a fallible tick callback; stop immediately if the consumer fails.
+    pub fn try_run_to_end<F>(&self, on_tick: F) -> Result<()>
+    where F: FnMut(&Context) -> Result<()>,
+    {
+        let parser = self.demo_parser()?;
+        self.prepared()?.session(parser)?.try_run_to_end(on_tick)?;
+        Ok(())
+    }
+
     /// Parse the entire demo. Create only the selected entity classes.
     pub fn run_to_end_filtered<F>(
         &self,
