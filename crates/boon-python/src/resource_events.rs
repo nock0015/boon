@@ -256,12 +256,14 @@ mod bag_tests {
     }
 }
 
-// Handles are signed network integers in real replay serializers; some
-// serializers expose the same bit range as unsigned. Preserve the generation.
+// Serializer integer widths/signs vary. The real sample uses U64 handles.
+// Bound the value to the original handle range and preserve the generation.
 pub(super) fn recorded_handle(value: Option<&boon_parser::FieldValue>) -> Option<u32> {
     match value {
         Some(boon_parser::FieldValue::I32(h)) if (0..16777215).contains(h) => Some(*h as u32),
         Some(boon_parser::FieldValue::U32(h)) if *h < 16777215 => Some(*h),
+        Some(boon_parser::FieldValue::U64(h)) if *h < 16777215 => Some(*h as u32),
+        Some(boon_parser::FieldValue::I64(h)) if (0..16777215).contains(h) => Some(*h as u32),
         _ => None,
     }
 }
@@ -279,7 +281,17 @@ mod handle_tests {
             recorded_handle(Some(&FieldValue::U32(7897163))),
             Some(7897163)
         );
+        assert_eq!(
+            recorded_handle(Some(&FieldValue::U64(7897163))),
+            Some(7897163)
+        );
+        assert_eq!(
+            recorded_handle(Some(&FieldValue::I64(7897163))),
+            Some(7897163)
+        );
         for value in [
+            FieldValue::U64(u64::MAX),
+            FieldValue::I64(-1),
             FieldValue::I32(-1),
             FieldValue::U32(16777215),
             FieldValue::F32(1.),
