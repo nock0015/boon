@@ -8,6 +8,12 @@ use serde_json::{Map as M, Value as V, json};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     io::Write,
+    sync::{
+        Mutex,
+        mpsc::{self, Receiver, SyncSender},
+    },
+    thread::{self, JoinHandle},
+    time::Instant,
 };
 type Id = (i64, i64);
 type Rows = IndexMap<i64, M<String, V>>;
@@ -1258,9 +1264,108 @@ struct Teams<'a> {
     #[serde(rename = "3")]
     sapphire: &'a [V],
 }
+#[derive(Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Timings {
+    feed_seconds: f64,
+    advance_seconds: f64,
+    projection_seconds: f64,
+    coverage_seconds: f64,
+    encoding_seconds: f64,
+    compression_seconds: f64,
+    compression_wait_seconds: f64,
+}
+type Compressed = Result<(i64, Vec<u8>, f64), String>;
+// Only one snapshot may be in flight. The coordinator can prepare the next
+// frame while this worker compresses the previous one, without replay-sized
+// queues, reordering observations, or multiplying the configured thread limit.
+struct Compressor {
+    input: Option<SyncSender<(i64, Vec<u8>)>>,
+    output: Mutex<Receiver<Compressed>>,
+    thread: Option<JoinHandle<()>>,
+    pending: bool,
+}
+impl Compressor {
+    fn new() -> Result<Self, String> {
+        let (input, requests) = mpsc::sync_channel::<(i64, Vec<u8>)>(1);
+        let (results, output) = mpsc::sync_channel(1);
+        let thread = thread::Builder::new()
+            .name("boon-view-compress".into())
+            .spawn(move || {
+                while let Ok((tick, bytes)) = requests.recv() {
+                    let result =
+                        compress(&bytes).map(|(payload, seconds)| (tick, payload, seconds));
+                    if results.send(result).is_err() {
+                        break;
+                    }
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            input: Some(input),
+            output: Mutex::new(output),
+            thread: Some(thread),
+            pending: false,
+        })
+    }
+    fn receive(&mut self) -> Compressed {
+        self.pending = false;
+        self.output
+            .lock()
+            .map_err(|e| e.to_string())?
+            .recv()
+            .map_err(|e| e.to_string())?
+    }
+}
+impl Drop for Compressor {
+    fn drop(&mut self) {
+        self.input.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+fn compress(encoded: &[u8]) -> Result<(Vec<u8>, f64), String> {
+    let start = Instant::now();
+    let mut zip = ZlibEncoder::new(Vec::new(), Compression::default());
+    zip.write_all(encoded).map_err(|e| e.to_string())?;
+    let payload = zip.finish().map_err(|e| e.to_string())?;
+    Ok((payload, start.elapsed().as_secs_f64()))
+}
 #[pyclass]
 pub struct KnownViews {
     state: State,
+    timings: Timings,
+    parallel: bool,
+    compressor: Option<Compressor>,
+}
+impl KnownViews {
+    fn encode(&mut self, tick: i64, time: f64) -> Result<Vec<u8>, String> {
+        let start = Instant::now();
+        let views = self.state.at(tick, time);
+        self.timings.projection_seconds += start.elapsed().as_secs_f64();
+        let start = Instant::now();
+        self.state.record(&views);
+        self.timings.coverage_seconds += start.elapsed().as_secs_f64();
+        let start = Instant::now();
+        let encoded = serde_json::to_vec(&Teams {
+            amber: &views[0],
+            sapphire: &views[1],
+        })
+        .map_err(|e| e.to_string())?;
+        self.timings.encoding_seconds += start.elapsed().as_secs_f64();
+        Ok(encoded)
+    }
+    fn receive(&mut self) -> Result<Option<(i64, Vec<u8>)>, String> {
+        let Some(worker) = self.compressor.as_mut().filter(|w| w.pending) else {
+            return Ok(None);
+        };
+        let start = Instant::now();
+        let (tick, payload, seconds) = worker.receive()?;
+        self.timings.compression_wait_seconds += start.elapsed().as_secs_f64();
+        self.timings.compression_seconds += seconds;
+        Ok(Some((tick, payload)))
+    }
 }
 fn error(e: impl std::fmt::Display) -> PyErr {
     PyValueError::new_err(e.to_string())
@@ -1279,7 +1384,13 @@ impl KnownViews {
             .collect();
         state.heroes = config["heroes"].as_object().cloned().unwrap_or_default();
         state.classes = config["classes"].as_object().cloned().unwrap_or_default();
-        Ok(Self { state })
+        let parallel = config["threads"].as_u64().is_some_and(|n| n >= 2);
+        Ok(Self {
+            state,
+            parallel,
+            timings: Timings::default(),
+            compressor: None,
+        })
     }
     /// Supply the same exact-version catalog used by the reference projector.
     /// The production restore sets it once in the constructor.
@@ -1290,6 +1401,7 @@ impl KnownViews {
     /// One bounded, already validated/decompressed evidence block. Never a replay.
     fn feed(&mut self, py: Python<'_>, data: Vec<u8>) -> PyResult<()> {
         py.detach(|| {
+            let start = Instant::now();
             if !self.state.pending.is_empty() {
                 return Err(error(
                     "Consume pending evidence before feeding another block",
@@ -1300,12 +1412,14 @@ impl KnownViews {
                     .pending
                     .push_back(serde_json::from_slice(line).map_err(error)?);
             }
+            self.timings.feed_seconds += start.elapsed().as_secs_f64();
             Ok(())
         })
     }
     /// False means a future record is held; True means another block may be read.
     fn advance(&mut self, py: Python<'_>, tick: i64) -> PyResult<bool> {
         py.detach(|| {
+            let start = Instant::now();
             while self
                 .state
                 .pending
@@ -1315,6 +1429,7 @@ impl KnownViews {
                 let row = self.state.pending.pop_front().unwrap();
                 self.state.apply(&row).map_err(error)?;
             }
+            self.timings.advance_seconds += start.elapsed().as_secs_f64();
             Ok(self.state.pending.is_empty())
         })
     }
@@ -1341,22 +1456,61 @@ impl KnownViews {
         time: f64,
     ) -> PyResult<Bound<'py, PyBytes>> {
         let payload = py.detach(|| -> PyResult<Vec<u8>> {
-            let views = self.state.at(tick, time);
-            self.state.record(&views);
-            let [a, b] = views;
-            let mut zip = ZlibEncoder::new(Vec::new(), Compression::default());
-            // Compress one bounded snapshot in a batch. Streaming tiny JSON
-            // tokens directly into deflate performs a compressor call for
-            // every key/scalar and dominates the actual projection.
-            let encoded = serde_json::to_vec(&Teams {
-                amber: &a,
-                sapphire: &b,
-            })
-            .map_err(error)?;
-            zip.write_all(&encoded).map_err(error)?;
-            zip.finish().map_err(error)
+            let encoded = self.encode(tick, time).map_err(error)?;
+            let (payload, seconds) = compress(&encoded).map_err(error)?;
+            self.timings.compression_seconds += seconds;
+            Ok(payload)
         })?;
         Ok(PyBytes::new(py, &payload))
+    }
+    /// Output is the previous completed frame when compression is overlapped.
+    /// With one configured thread, it is the current frame synchronously.
+    fn submit<'py>(
+        &mut self,
+        py: Python<'py>,
+        tick: i64,
+        time: f64,
+    ) -> PyResult<Option<(i64, Bound<'py, PyBytes>)>> {
+        let result = py
+            .detach(|| -> Result<Option<(i64, Vec<u8>)>, String> {
+                let encoded = self.encode(tick, time)?;
+                if !self.parallel {
+                    let (payload, seconds) = compress(&encoded)?;
+                    self.timings.compression_seconds += seconds;
+                    return Ok(Some((tick, payload)));
+                }
+                if self.compressor.is_none() {
+                    self.compressor = Some(Compressor::new()?);
+                }
+                let previous = self.receive()?;
+                let worker = self.compressor.as_mut().unwrap();
+                worker
+                    .input
+                    .as_ref()
+                    .ok_or("Compressor is closed")?
+                    .send((tick, encoded))
+                    .map_err(|e| e.to_string())?;
+                worker.pending = true;
+                Ok(previous)
+            })
+            .map_err(error)?;
+        Ok(result.map(|(tick, payload)| (tick, PyBytes::new(py, &payload))))
+    }
+    fn finish<'py>(&mut self, py: Python<'py>) -> PyResult<Option<(i64, Bound<'py, PyBytes>)>> {
+        let result = py
+            .detach(|| {
+                let result = self.receive();
+                self.compressor.take();
+                result
+            })
+            .map_err(error)?;
+        Ok(result.map(|(tick, payload)| (tick, PyBytes::new(py, &payload))))
+    }
+    fn timings(&self) -> PyResult<String> {
+        let mut value = serde_json::to_value(&self.timings).map_err(error)?;
+        value["parallelCompression"] = json!(self.parallel);
+        value["maximumInFlightSnapshots"] = json!(1);
+        serde_json::to_string(&value).map_err(error)
     }
     fn statistics(&self) -> PyResult<String> {
         let mut coverage = Vec::new();

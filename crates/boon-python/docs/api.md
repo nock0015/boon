@@ -1807,3 +1807,14 @@ between bounded blocks/frames, and progress reporting remain in Python.
 Individual field/fact insertion order and exact f64 round-tripping are preserved.
 JSON escaping and compressed bytes may differ while decoded values and order
 remain identical. The original indexed evidence bytes are retained unchanged.
+
+For restore jobs, `submit(tick, time)` and `finish()` provide a bounded compression
+pipeline. With a thread budget of at least two, one persistent native worker
+compresses the previous snapshot while the coordinator prepares the next one.
+Only one compression request may be in flight; results remain in source order,
+and `finish()` drains the final result and joins the worker. A one-thread budget
+uses synchronous compression. The worker never reads or mutates entity/visibility
+state. `timings()` separates block parsing, state application, view preparation,
+coverage, JSON encoding, compression, and waiting for compression. Overlapping
+component times are not additive wall time. Pipeline timings are diagnostics,
+not persisted model inputs or cache metadata.
