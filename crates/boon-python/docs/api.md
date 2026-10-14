@@ -1781,3 +1781,29 @@ not classify minion riders or merge nodes. The caller creates independent team
 containers. Source/fact insertion order is retained because pretraining's
 masked-fact sampling consumes that order. Other team-knowledge projections
 remain in the source-qualified lab implementation.
+
+### Internal restore team-view projection
+
+`boon._boon.KnownViews` implements the complete existing team-known entity
+projection over bounded, validated evidence blocks. `feed(bytes)` accepts one
+decompressed archive block; `advance(source_tick)` applies only records through
+that frame and retains the first future record. Another block is accepted only
+when the pending block is consumed. `project(source_tick, match_seconds)` returns
+a compressed team-view payload and accumulates coverage/exclusion counters.
+Normalization, alias-owner order, controller/pawn identity, independent team
+visibility and last-seen memory, public objective HP/life, public camp markers and
+timers, zipline ownership/connections, individual stat contributions, inventories,
+AP upgrades, Rift fractions, and owned ability state follow the Python reference.
+No activity labels or team knowledge are inferred from hidden state.
+
+The constructor receives the existing Python team's roster, pinned display-only
+hero catalog, and exact-version minimap class catalog. `apply_json`, `at_json`,
+and `set_classes` support differential checks against the reference; they are
+internal helpers, not a replacement public replay API. `statistics()` reports
+measured frame/node/coverage/exclusion counts. Parsing, state updates, projection,
+and compression release Python's interpreter lock. SQLite writes, cancellation
+between bounded blocks/frames, and progress reporting remain in Python.
+
+Individual field/fact insertion order and exact f64 round-tripping are preserved.
+JSON escaping and compressed bytes may differ while decoded values and order
+remain identical. The original indexed evidence bytes are retained unchanged.
