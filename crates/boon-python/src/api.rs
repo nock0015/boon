@@ -3,8 +3,8 @@ use crate::*;
 #[pymethods]
 impl Demo {
     #[new]
-    #[pyo3(signature = (path, *, preload = true))]
-    pub(crate) fn new(py: Python<'_>, path: &str, preload: bool) -> PyResult<Self> {
+    #[pyo3(signature = (path, *, preload = true, bounded = false))]
+    pub(crate) fn new(py: Python<'_>, path: &str, preload: bool, bounded: bool) -> PyResult<Self> {
         let path = PathBuf::from(path);
 
         // Check if file exists first for a clear FileNotFoundError
@@ -16,6 +16,7 @@ impl Demo {
         }
 
         let parser = boon_parser::Parser::from_file(&path).map_err(to_py_err)?;
+        let parser = if bounded { parser.without_prepared_index() } else { parser };
 
         // Verify the file is a valid demo
         parser.verify().map_err(to_py_err)?;
@@ -83,6 +84,7 @@ impl Demo {
             match_id,
             game_mode,
             paused_ticks: None,
+            paused_ticks_disk: None,
             cached_datasets: DatasetCache::default(),
             cached_barriers: std::sync::OnceLock::new(),
             cached_summary: None,
@@ -490,7 +492,8 @@ impl Demo {
         let Some(pregame) = self.pregame_seconds()? else {
             return Ok(None);
         };
-        Ok(Some(self.tick_to_seconds(tick)? - pregame))
+        self.ensure_paused_ticks_built()?;
+        Ok(self.resolved_tick_to_match_seconds(tick,Some(pregame)))
     }
 
     /// Convert a tick to an on-screen match-clock string (for example, ``"03:14"``),
@@ -599,5 +602,15 @@ impl Demo {
     #[staticmethod]
     pub(crate) fn available_datasets() -> Vec<&'static str> {
         Dataset::ALL.into_iter().map(Dataset::as_str).collect()
+    }
+}
+
+
+impl Demo {
+    /// The read-only core of tick_to_match_seconds after its existing lazy
+    /// pregame/pause state has been resolved. Evidence uses this same path.
+    pub(super) fn resolved_tick_to_match_seconds(&self,tick:i32,pregame:Option<f64>)->Option<f64> {
+        crate::entity_evidence::evidence_clock::resolved_match_seconds(
+            self.count_active_ticks(tick),self.tick_rate,pregame)
     }
 }

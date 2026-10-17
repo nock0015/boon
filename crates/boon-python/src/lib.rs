@@ -45,6 +45,9 @@ mod restore_views;
 mod getters;
 mod hero_stats;
 mod loader;
+mod replay_catalog;
+mod bounded_spool;
+mod optional_events;
 mod minimap;
 mod names;
 mod player_states;
@@ -83,6 +86,7 @@ struct Demo {
     game_mode: i64,
     // Sorted ticks where the game was paused (lazily built from world_ticks)
     paused_ticks: Option<Vec<i32>>,
+    paused_ticks_disk: Option<std::sync::Mutex<(std::fs::File,u64)>>,
     cached_datasets: DatasetCache,
     cached_barriers: std::sync::OnceLock<BarrierTimeline>,
     cached_summary: Option<SummaryFrames>,
@@ -102,7 +106,10 @@ struct Demo {
 /// Python bindings for the Boon Deadlock demo parser.
 #[pymodule]
 fn _boon(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("ENTITY_EVIDENCE_WIRE_VERSION",1u32)?;
+    m.add_function(wrap_pyfunction!(replay_catalog::_verify_replay_catalog, m)?)?;
     m.add_class::<Demo>()?;
+    m.add_class::<bounded_spool::NativeSpoolReader>()?;
     m.add_class::<restore_index::EvidenceIndex>()?;
     m.add_class::<restore_ziplines::ZiplineViews>()?;
     m.add_class::<restore_views::KnownViews>()?;

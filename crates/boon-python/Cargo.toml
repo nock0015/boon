@@ -16,13 +16,19 @@ crate-type = ["cdylib"]
 serde.workspace = true
 serde_json = { workspace = true, features = ["float_roundtrip", "preserve_order"] }
 flate2 = "1.1"
+sha2 = "0.10"
+tempfile = "3"
+rusqlite = { version = "0.32", features = ["bundled"] }
 indexmap = "2"
 boon_parser = { path = "../boon", package = "boon-deadlock" }
 boon-proto = { workspace = true }
 prost.workspace = true
 pyo3 = { version = "0.27", features = ["extension-module", "multiple-pymethods"] }
 pyo3-polars = "0.26"
-polars = "0.53"
+polars = { version = "0.53", features = ["ipc"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.180"
 
 [lints]
 workspace = true

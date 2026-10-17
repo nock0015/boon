@@ -250,7 +250,7 @@ Return exact-identity Guardian (`CNPC_TrooperBoss`), Walker
 (`CNPC_Boss_Tier2`), and Rift cash-in (`CCitadel_KothCashIn`) observations at
 the selected replay ticks. The result has one row per active target and observer
 team (2 or 3). Entity index and serial columns are metadata-only join keys; do
-not use numerical identity values as model inputs.
+not interpret numerical identity values as gameplay measurements.
 
 The minimap fields come only from the observer team's recorded
 `CCitadelTeam.m_vecFOWEntities` row. Boon resolves the raw index using both
@@ -1759,7 +1759,7 @@ stream is not a complete replay and must not be committed as one.
 The source ticks, entity lifetimes, individual fields, floating-point bits and
 existing explicit animation-field exclusion are unchanged. This is recorded
 server evidence; consumers must still apply their team-knowledge policy before
-using it as model input. The existing gzip-file method remains supported.
+presenting observer-specific information. The existing gzip-file method remains supported.
 
 ### Internal bounded restore helpers
 
@@ -1770,7 +1770,7 @@ record counts, and exact index/serial membership. `finish()` requires a valid
 completion footer and flushes the final block. `metadata()` is available only
 after successful completion. Parsing, validation, and compression release the
 Python interpreter lock. Current streams must declare the rendering-field
-exclusion; legacy all-fields archives continue through the lab's reference
+exclusion; legacy all-fields archives require a compatible reference
 importer so their field order and serialization remain unchanged.
 
 `boon._boon.ZiplineViews` maintains individual normalized zipline records by
@@ -1778,9 +1778,8 @@ index and serial. `update` and `remove` invalidate cached views on exact input
 changes; `project(tick)` serializes the current public node positions, ownership,
 lane, connections, and frontier evidence outside the interpreter lock. It does
 not classify minion riders or merge nodes. The caller creates independent team
-containers. Source/fact insertion order is retained because pretraining's
-masked-fact sampling consumes that order. Other team-knowledge projections
-remain in the source-qualified lab implementation.
+containers. Source/fact insertion order is retained exactly for consumers.
+Additional application-specific projections remain the responsibility of the caller.
 
 ### Internal restore team-view projection
 
@@ -1817,4 +1816,18 @@ uses synchronous compression. The worker never reads or mutates entity/visibilit
 state. `timings()` separates block parsing, state application, view preparation,
 coverage, JSON encoding, compression, and waiting for compression. Overlapping
 component times are not additive wall time. Pipeline timings are diagnostics,
-not persisted model inputs or cache metadata.
+not persisted evidence or cache metadata.
+
+
+### Typed entity evidence bridge
+
+`boon.ENTITY_EVIDENCE_WIRE_VERSION == 1` qualifies the ownership-safe binary
+transport for matching prepared-input consumers.
+`Demo.stream_entity_evidence_typed(*, sink)` emits bounded immutable `bytes`
+chunks with backpressure, exact field value tags and float bits, ordered
+lifecycle/delta records, interned class/field schemas and a mandatory SHA256
+completion footer. `Demo.entity_evidence_wire_header()` returns the semantic
+policy header, which is also carried and validated inside that bound stream.
+The existing JSON methods remain available. Bytes are an explicit protocol,
+not serialized Rust objects or cross-extension pointers. No additional gameplay
+field exclusions, sampling changes or cooldown approximations are applied.

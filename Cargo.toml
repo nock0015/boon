@@ -1,5 +1,5 @@
 [workspace]
-exclude = ["scripts/build-protos"]
+exclude = ["scripts/build-protos", "vendor/pbdems2"]
 members = [
   "crates/boon",
   "crates/boon-dev",
@@ -15,7 +15,7 @@ rust-version = "1.88.0"
 [workspace.dependencies]
 boon = { path = "crates/boon", package = "boon-deadlock", version = "0.15.0" }
 boon-proto = { path = "crates/boon-proto", version = "0.4" }
-pbdems2 = "0.3.6"
+pbdems2 = { version = "=0.3.6", path = "vendor/pbdems2" }
 anyhow = "1.0"
 criterion = "0.5"
 prost = "0.14"
@@ -54,5 +54,8 @@ opt-level = 1
 debug = false         # never step into prost-generated proto code; skip its debuginfo
 
 [profile.release]
-lto = true          # Link-time optimization
-codegen-units = 1   # Better optimization, slower compile
+# Memory-bounded target parser release profile, selected for the WSL budget.
+# Full-program LTO can exceed the build allowance in Polars; keep independent
+# codegen units instead. The separate backend native module owns its profile.
+lto = false
+codegen-units = 16

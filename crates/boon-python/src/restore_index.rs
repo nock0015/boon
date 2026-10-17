@@ -1,5 +1,6 @@
 //! Bounded evidence validation and archive indexing outside Python's GIL.
-//! No model labels, sampling, visibility decisions, or record aggregation.
+//! No downstream labels, sampling, visibility decisions, or record aggregation.
+use crate::entity_evidence::{movement_policy,evidence_clock};
 use flate2::{Compression, write::ZlibEncoder};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -8,10 +9,31 @@ use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
 
 const PREFIX: &str = "CBodyComponent.m_animationController.";
+// Exact network-class exclusions authorized for detailed rendering evidence only.
+// Ability, modifier, team/FOW, position and objective entities remain included.
+const EXCLUDED_ENTITY_CLASS_POLICY: &str = "boon-render-entity-exclusions-v1";
+const EXCLUDED_ENTITY_CLASSES: [&str; 9] = [
+    "CAssignedLaneParticle",
+    "CEnvCombinedLightProbeVolume",
+    "CEnvCubemapFog",
+    "CEnvVolumetricFogController",
+    "CEnvVolumetricFogVolume",
+    "CFogController",
+    "CFuncBrush",
+    "CParticleSystem",
+    "CPathParticleRope",
+];
+fn excluded_entity_class(name: &str) -> bool {
+    EXCLUDED_ENTITY_CLASSES.contains(&name)
+}
+
 #[derive(Default)]
 struct Index {
     pending: Vec<u8>,
     header: bool,
+    entity_class_exclusions: bool,
+    movement_policy: bool,
+    ability_usage_clock: bool,
     complete: bool,
     finished: bool,
     count: u64,
@@ -97,6 +119,16 @@ impl Index {
             if !current {
                 return Err("Unknown entity-evidence field exclusions".into());
             }
+            let entity_policy=row.get("excludedEntityClassPolicy");
+            let entity_exclusions=row.get("excludedEntityClasses");
+            self.entity_class_exclusions=if entity_policy.is_none() && entity_exclusions.is_none() {
+                false // Prior valid archives retain their original class coverage.
+            } else if entity_policy==Some(&json!(EXCLUDED_ENTITY_CLASS_POLICY))
+                && entity_exclusions==Some(&json!(EXCLUDED_ENTITY_CLASSES)) {
+                true
+            } else {return Err("Unknown entity-evidence class exclusions".into());};
+            self.movement_policy=movement_policy::validate_header(&row)?;
+            self.ability_usage_clock=evidence_clock::validate_header(&row)?;
             self.header = true;
             return Ok(());
         }
@@ -131,6 +163,11 @@ impl Index {
         {
             return Err("Malformed/out-of-order entity-evidence record".into());
         }
+        if self.entity_class_exclusions && excluded_entity_class(&class) {
+            return Err("Declared excluded entity class is present in current evidence".into());
+        }
+        movement_policy::validate_samples(&row,self.movement_policy)?;
+        evidence_clock::validate_record(&row,self.ability_usage_clock)?;
         let identity = (index, serial);
         let mut excluded = Vec::new();
         if kind == "absent" {
@@ -247,7 +284,14 @@ impl Index {
         Ok(out)
     }
     fn metadata(&self) -> Value {
-        json!({"schema":"boon-entity-evidence-v1","storage":"lossless-bounded-record-blocks-v1","chunks":self.chunk,"records":self.count,"entityClasses":self.classes,"excludedFieldPrefixes":[PREFIX],"legacyAnimationFieldsRemoved":self.animation,"unsupportedFieldOccurrences":self.unsupported,"modelInput":false,"clock":"source-demo-tick","granularity":"end-of-source-tick","scope":"recorded-server-state"})
+        let mut result=json!({"schema":"boon-entity-evidence-v1","storage":"lossless-bounded-record-blocks-v1","chunks":self.chunk,"records":self.count,"entityClasses":self.classes,"excludedFieldPrefixes":[PREFIX],"legacyAnimationFieldsRemoved":self.animation,"unsupportedFieldOccurrences":self.unsupported,"clock":"source-demo-tick","granularity":"end-of-source-tick","scope":"recorded-server-state"});
+        if self.entity_class_exclusions {
+            result["excludedEntityClassPolicy"]=json!(EXCLUDED_ENTITY_CLASS_POLICY);
+            result["excludedEntityClasses"]=json!(EXCLUDED_ENTITY_CLASSES);
+        }
+        if self.movement_policy {result["movementPolicy"]=movement_policy::header();}
+        if self.ability_usage_clock {result["abilityUsageClock"]=evidence_clock::header();}
+        result
     }
 }
 
@@ -307,6 +351,33 @@ mod tests {
     use super::*;
     fn header() -> Value {
         json!({"kind":"header","schema":"boon-entity-evidence-v1","scope":"recorded-server-state","clock":"source-demo-tick","granularity":"end-of-source-tick","encoding":"entity-field-deltas","averaging":false,"allDecodedFields":false,"excludedFieldPrefixes":[PREFIX]})
+    }
+    #[test]
+    fn versioned_render_exclusions_are_exact_and_keep_old_archives() {
+        let mut old=Index::new();feed(&mut old,header()).unwrap();
+        let mut row=record();row["entity_class"]=json!("CParticleSystem");
+        feed(&mut old,row.clone()).unwrap();
+        assert!(!old.metadata().as_object().unwrap().contains_key("excludedEntityClasses"));
+        let mut h=header();h["excludedEntityClassPolicy"]=json!(EXCLUDED_ENTITY_CLASS_POLICY);
+        h["excludedEntityClasses"]=json!(EXCLUDED_ENTITY_CLASSES);
+        for class in EXCLUDED_ENTITY_CLASSES {
+            let mut current=Index::new();feed(&mut current,h.clone()).unwrap();
+            row["entity_class"]=json!(class);
+            assert!(feed(&mut current,row.clone()).err().unwrap().contains("excluded entity class"));
+        }
+        let mut current=Index::new();feed(&mut current,h.clone()).unwrap();
+        feed(&mut current,record()).unwrap();
+        assert_eq!(current.metadata()["excludedEntityClasses"],json!(EXCLUDED_ENTITY_CLASSES));
+        for key in ["excludedEntityClassPolicy","excludedEntityClasses"] {
+            let mut bad=h.clone();bad.as_object_mut().unwrap().remove(key);
+            assert!(feed(&mut Index::new(),bad).err().unwrap().contains("class exclusions"));
+        }
+        for bad in [json!([]),json!(["CParticleSystem"]),json!(["CCitadelPlayerPawn"])] {
+            let mut bad_header=h.clone();bad_header["excludedEntityClasses"]=bad;
+            assert!(feed(&mut Index::new(),bad_header).err().unwrap().contains("class exclusions"));
+        }
+        h["excludedEntityClassPolicy"]=json!("unknown");
+        assert!(feed(&mut Index::new(),h).err().unwrap().contains("class exclusions"));
     }
     fn record() -> Value {
         json!({"kind":"state","sequence":0,"tick":4,"entity_index":1,"entity_serial":3,"entity_class":"NPC","active":true,"fields":{}})

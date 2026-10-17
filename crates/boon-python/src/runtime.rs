@@ -18,17 +18,7 @@ impl Demo {
                 .map(|id| (id as u32, id))
                 .collect();
             let frames = py.detach(|| {
-                let event_types = HashSet::from([Msg::KEUserMsgPostMatchDetails as u32]);
-                let events = self
-                    .parser
-                    .events_filtered(None, &event_types)
-                    .map_err(to_py_err)?;
-                let event = events
-                    .iter()
-                    .find(|e| e.msg_type == Msg::KEUserMsgPostMatchDetails as u32)
-                    .ok_or_else(|| {
-                        DemoMessageError::new_err("no PostMatchDetails event found in demo")
-                    })?;
+                let event = self.parser.first_event_of_type(Msg::KEUserMsgPostMatchDetails as u32).map_err(to_py_err)?.ok_or_else(|| DemoMessageError::new_err("no PostMatchDetails event found in demo"))?;
 
                 let outer = CCitadelUserMsgPostMatchDetails::decode(event.payload.as_slice())
                     .map_err(|e| {
@@ -89,6 +79,24 @@ impl Demo {
         if self.paused_ticks.is_some() {
             return Ok(());
         }
+        if self.paused_ticks_disk.is_some() {return Ok(());}
+        if self.parser.has_bounded_sessions() {
+            use std::io::{Write,Seek};
+            let init=self.parser.parse_init().map_err(to_py_err)?;
+            let keys=WkKeys::resolve(&init);drop(init);
+            let mut file=tempfile::tempfile()?;
+            let mut count=0u64;
+            self.parser.try_run_to_end_filtered(&HashSet::from(["CCitadelGameRulesProxy"]),|ctx| {
+                let mut row=WtCols::default();row.collect_tick(ctx,&keys);
+                for (tick,paused) in row.tick.into_iter().zip(row.is_paused) {
+                    if paused {file.write_all(&tick.to_le_bytes())?;count+=1;}
+                }
+                Ok(())
+            }).map_err(to_py_err)?;
+            file.rewind()?;
+            self.paused_ticks_disk=Some(std::sync::Mutex::new((file,count)));
+            return Ok(());
+        }
         if self.cached_datasets[Dataset::WorldTicks].is_none() {
             Python::attach(|py| self.load_datasets(py, &[Dataset::WorldTicks]))?;
         }
@@ -112,6 +120,20 @@ impl Demo {
 
     /// Count non-paused ticks up to the given tick.
     pub(super) fn count_active_ticks(&self, tick: i32) -> i32 {
+        if let Some(disk)=&self.paused_ticks_disk {
+            use std::io::{Read,Seek,SeekFrom};
+            let mut owner=disk.lock().expect("source clock spool lock poisoned");
+            let count=owner.1;
+            let file=&mut owner.0;
+            let (mut low,mut high)=(0,count);
+            while low<high {
+                let middle=(low+high)/2;
+                file.seek(SeekFrom::Start(middle*4)).expect("source clock spool seek failed");
+                let mut value=[0u8;4];file.read_exact(&mut value).expect("source clock spool read failed");
+                if i32::from_le_bytes(value)<tick {low=middle+1;} else {high=middle;}
+            }
+            return (i64::from(tick)-low as i64).max(0) as i32;
+        }
         let paused = self
             .paused_ticks
             .as_ref()
@@ -131,25 +153,26 @@ impl Demo {
             Msg::KEUserMsgGameOver as u32,
             Msg::KEUserMsgBannedHeroes as u32,
         ]);
-        let events = self
-            .parser
-            .events_filtered(None, &event_types)
-            .map_err(to_py_err)?;
         let mut banned: Vec<u32> = Vec::new();
-        for event in &events {
-            if event.msg_type == Msg::KEUserMsgGameOver as u32
-                && let Ok(msg) =
-                    boon_proto::proto::CCitadelUserMessageGameOver::decode(event.payload.as_slice())
-            {
-                self.game_over = Some((msg.winning_team.unwrap_or(0), event.tick));
+        let mut game_over=self.game_over;
+        let mut apply=|events:&[boon_parser::GameEvent]| {
+            for event in events {
+                if event.msg_type==Msg::KEUserMsgGameOver as u32 {
+                    if let Ok(msg)=boon_proto::proto::CCitadelUserMessageGameOver::decode(event.payload.as_slice()) {
+                        game_over=Some((msg.winning_team.unwrap_or(0),event.tick));
+                    }
+                }
+                if event.msg_type==Msg::KEUserMsgBannedHeroes as u32 {
+                    if let Ok(msg)=boon_proto::proto::CCitadelUserMsgBannedHeroes::decode(event.payload.as_slice()) {banned.extend(msg.banned_hero_ids);}
+                }
             }
-            if event.msg_type == Msg::KEUserMsgBannedHeroes as u32
-                && let Ok(msg) =
-                    boon_proto::proto::CCitadelUserMsgBannedHeroes::decode(event.payload.as_slice())
-            {
-                banned.extend(msg.banned_hero_ids);
-            }
+        };
+        if self.parser.has_bounded_sessions() {
+            self.parser.try_run_to_end_with_event_types_filtered(&HashSet::new(),&event_types,|_,events|{apply(events);Ok(())}).map_err(to_py_err)?;
+        } else {
+            apply(&self.parser.events_filtered(None,&event_types).map_err(to_py_err)?);
         }
+        self.game_over=game_over;
         // A completed scan always sets Some.
         // An empty list means "no ban data" and not "not scanned."
         self.banned_hero_ids = Some(banned);
@@ -369,7 +392,7 @@ impl Demo {
         Ok(merged)
     }
 
-    fn barrier_timeline(&self, wants: SnapWants) -> PyResult<Option<&BarrierTimeline>> {
+    pub(super) fn barrier_timeline(&self, wants: SnapWants) -> PyResult<Option<&BarrierTimeline>> {
         if !wants.player_ticks {
             return Ok(None);
         }

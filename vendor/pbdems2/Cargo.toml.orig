@@ -1,0 +1,84 @@
+[package]
+name = "pbdems2"
+version = "0.3.6"
+edition = "2024"
+rust-version = "1.88.0"
+description = "Game-neutral Source 2 PBDEMS2 demo parsing primitives"
+license = "MIT"
+repository = "https://github.com/pnxenopoulos/pbdems2"
+documentation = "https://docs.rs/pbdems2"
+readme = "README.md"
+authors = ["Peter Xenopoulos"]
+keywords = ["source2", "demo", "parser", "replay", "game"]
+categories = ["game-development", "parser-implementations", "encoding", "parsing"]
+include = ["src/**", "tests/**", "Cargo.toml", "README.md", "LICENSE"]
+
+[package.metadata.docs.rs]
+all-features = true
+# Lets `doc(cfg(...))` label feature-gated items on docs.rs, which builds on
+# nightly. The cfg is never set for ordinary builds.
+rustdoc-args = ["--cfg", "docsrs"]
+
+[workspace]
+members = [".", "crates/pbdems2-bench", "crates/pbdems2-cli"]
+default-members = ["."]
+resolver = "3"
+
+[workspace.dependencies]
+pbdems2 = { path = "." }
+rustc-hash = "2.1.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+snap = "1.1.1"
+tempfile = "3.27.0"
+
+[features]
+default = ["serde"]
+mmap = ["dep:memmap2"]
+serde = ["dep:serde"]
+
+[dependencies]
+memmap2 = { version = "0.9.11", optional = true }
+rustc-hash.workspace = true
+# "rc" implements Serialize for the Arc<str> class names on ClassEntry.
+serde = { workspace = true, features = ["rc"], optional = true }
+snap.workspace = true
+thiserror = "2.0.17"
+
+[dev-dependencies]
+proptest = "1.11.0"
+serde_json.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
+
+[workspace.lints.rust]
+# `missing_docs` is denied per-crate in lib.rs rather than here, so it applies
+# to the library targets only and not to generated items in integration tests.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docsrs)"] }
+unsafe_op_in_unsafe_fn = "deny"
+unused_lifetimes = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+redundant_clone = "warn"
+inefficient_to_string = "warn"
+manual_let_else = "warn"
+undocumented_unsafe_blocks = "deny"
+
+[profile.dev]
+incremental = false
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "debuginfo"
+
+[profile.bench]
+inherits = "release"
+debug = true
+strip = false

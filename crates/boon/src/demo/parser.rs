@@ -130,6 +130,7 @@ impl AsRef<[u8]> for Storage {
 /// The main parser. Owns the demo file data (memory-mapped or in-memory).
 pub struct Parser {
     storage: Storage,
+    bounded: bool,
     replay_identity: std::sync::Arc<()>,
     prepared_cache: OnceLock<PreparedPlayback<CitadelAdapter>>,
     prepared_lock: Mutex<()>,
@@ -146,11 +147,18 @@ impl Parser {
         let mmap = unsafe { Mmap::map(&file)? };
         Ok(Self {
             storage: Storage::Mmap(mmap),
+            bounded: false,
             replay_identity: std::sync::Arc::new(()),
             prepared_cache: OnceLock::new(),
             prepared_lock: Mutex::new(()),
         })
     }
+
+    /// Select cold sequential sessions without retaining a replay-sized index.
+    /// Existing APIs keep prepared playback unless explicitly opted in.
+    pub fn without_prepared_index(mut self) -> Self { self.bounded=true; self }
+    pub fn has_bounded_sessions(&self) -> bool { self.bounded }
+    pub fn has_prepared_index(&self) -> bool { self.prepared_cache.get().is_some() }
 
     /// Create a parser from an in-memory byte buffer.
     ///
@@ -159,6 +167,7 @@ impl Parser {
     pub fn from_bytes(bytes: Vec<u8>) -> Self {
         Self {
             storage: Storage::Bytes(bytes),
+            bounded: false,
             replay_identity: std::sync::Arc::new(()),
             prepared_cache: OnceLock::new(),
             prepared_lock: Mutex::new(()),
@@ -335,7 +344,7 @@ impl Parser {
     /// `DEM_Packet`, `DEM_SignonPacket`, and `DEM_FullPacket` commands.
     /// If `max_tick` is set, stops parsing once the tick exceeds the limit.
     pub fn events(&self, max_tick: Option<i32>) -> Result<Vec<GameEvent>> {
-        self.decode_events(max_tick, None)
+        self.decode_events(max_tick, None, None)
     }
 
     /// Parse only events whose final numeric message type is selected.
@@ -347,13 +356,21 @@ impl Parser {
         max_tick: Option<i32>,
         event_types: &HashSet<u32>,
     ) -> Result<Vec<GameEvent>> {
-        self.decode_events(max_tick, Some(event_types))
+        self.decode_events(max_tick, Some(event_types), None)
+    }
+
+    /// Return the same first matching occurrence as events_filtered().find(),
+    /// without retaining later records from the replay.
+    pub fn first_event_of_type(&self,event_type:u32)->Result<Option<GameEvent>> {
+        let mut events=self.decode_events(None,Some(&HashSet::from([event_type])),Some(1))?;
+        Ok(events.pop())
     }
 
     fn decode_events(
         &self,
         max_tick: Option<i32>,
         event_types: Option<&HashSet<u32>>,
+        maximum:Option<usize>,
     ) -> Result<Vec<GameEvent>> {
         self.verify()?;
         let data = &self.data()[HEADER_SIZE..];
@@ -410,6 +427,9 @@ impl Parser {
                 _ => {
                     reader.skip(header.body_size as usize)?;
                 }
+            }
+            if maximum.is_some_and(|maximum|events.len()>=maximum) {
+                events.truncate(maximum.unwrap());break;
             }
         }
 

@@ -14,6 +14,8 @@ from boon import (
 )
 from boon._boon import (
     Demo,
+    ENTITY_EVIDENCE_WIRE_VERSION,
+    NativeSpoolReader,
     game_mode_names,
     hitgroup_names,
     lifestate_names,
@@ -54,6 +56,7 @@ Demo.teamfights = stats.teamfights
 Demo.time_dead = stats.time_dead
 
 __all__ = [
+    "NativeSpoolReader",
     "AbilityStat",
     "AbilityStatResult",
     "ImbueResult",

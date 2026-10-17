@@ -1,6 +1,6 @@
 //! Exact-identity objective observations from recorded team FOW and current Rift rules.
 //!
-//! Entity index/serial columns are join metadata. They are not model features.
+//! Entity index/serial columns are join metadata. They are not gameplay measurements.
 //! Guardian and Walker server health/position are intentionally not exported.
 
 use crate::*;
@@ -715,5 +715,71 @@ mod tests {
         assert!(!valid_rift_location(&[0.0, 0.0, 0.0]));
         assert!(!valid_rift_location(&[f32::MAX, 0.0, 0.0]));
         assert!(!valid_rift_location(&[f32::NAN, 1.0, 2.0]));
+    }
+}
+
+impl Demo {
+    pub(super) fn spool_targets(&self,sink:&mut crate::bounded_spool::Spool,ticks:Vec<i32>)->PyResult<()> {
+        let selected: HashSet<i32> = ticks.into_iter().collect();
+        if selected
+            .iter()
+            .any(|tick| *tick < 0 || *tick > self.total_ticks)
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "ticks must be within the demo tick range",
+            ));
+        }
+        if selected.is_empty() {
+            return Ok(());
+        }
+        {
+            let init = self.parser.parse_init().map_err(to_py_err)?;
+            let keys = target_keys(&init);
+            let rules_keys = rules_keys(&init);
+            let filter = HashSet::from([
+                "CCitadelTeam",
+                "CCitadelGameRulesProxy",
+                "CNPC_TrooperBoss",
+                "CNPC_Boss_Tier2",
+                "CCitadel_KothCashIn",
+            ]);
+            let mut columns = TargetObservationCols::default();
+            let mut emitted = HashSet::new();
+            let mut error=None;
+            self.parser
+                .try_run_to_end_filtered(&filter, |ctx| {
+                    if error.is_some() {return Err(crate::bounded_spool::aborted());}
+                    if let Err(e)=sink.check_cancel() {error=Some(e);return Err(crate::bounded_spool::aborted());}
+                    let tick = ctx.tick();
+                    if !selected.contains(&tick) || !emitted.insert(tick) {
+                        return Ok(());
+                    }
+                    let targets = targets_at(ctx, &keys);
+                    let rules = ctx
+                        .entities()
+                        .iter()
+                        .find(|(_, entity)| {
+                            entity.active && entity.class_name.as_ref() == "CCitadelGameRulesProxy"
+                        })
+                        .map(|(_, entity)| entity);
+                    for observer_team in [2, 3] {
+                        collect_team(
+                            ctx,
+                            observer_team,
+                            &targets,
+                            rules,
+                            rules_keys,
+                            &mut columns,
+                        );
+                    }
+                    if columns.tick.len()>=1024 {
+                        error=std::mem::take(&mut columns).into_dataframe().and_then(|frame|sink.write("targets",frame)).err();
+                    }
+                    if error.is_some() {Err(crate::bounded_spool::aborted())} else {Ok(())}
+                })
+                .map_err(|e|error.take().unwrap_or_else(||to_py_err(e)))?;
+            if let Some(error)=error {return Err(error);}
+            sink.write("targets",columns.into_dataframe()?)
+        }
     }
 }

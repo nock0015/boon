@@ -34,6 +34,12 @@ impl Demo {
 
 impl Demo {
     pub(super) fn load_datasets(&mut self, py: Python<'_>, datasets: &[Dataset]) -> PyResult<()> {
+        self.collect_datasets(py, datasets, None)
+    }
+
+    pub(super) fn collect_datasets(&mut self, py: Python<'_>, datasets: &[Dataset], mut spool: Option<&mut crate::bounded_spool::Spool>) -> PyResult<()> {
+        let optional_events=spool.as_ref().is_some_and(|s|s.optional_events);
+        let mut optional_breakables=crate::optional_events::Collector::default();
         // Check game mode for street brawl datasets
         if datasets.iter().any(|dataset| dataset.is_street_brawl()) && self.game_mode != 4 {
             return Err(NotStreetBrawlError::new_err(
@@ -50,22 +56,22 @@ impl Demo {
             || requested(Dataset::ItemPurchases)
             || requested(Dataset::Chat);
 
-        let needs = |dataset| requested(dataset) && self.cached_datasets[dataset].is_none();
-        let load_abilities = kill_cohort && self.cached_datasets[Dataset::Abilities].is_none();
+        let needs = |dataset| requested(dataset) && (spool.is_some() || self.cached_datasets[dataset].is_none());
+        let load_abilities = (requested(Dataset::Abilities) || (spool.is_none() && kill_cohort)) && (spool.is_some() || self.cached_datasets[Dataset::Abilities].is_none());
         let load_player_ticks = needs(Dataset::PlayerTicks);
         let load_world_ticks = needs(Dataset::WorldTicks);
-        let load_kills = kill_cohort && self.cached_datasets[Dataset::Kills].is_none();
+        let load_kills = (requested(Dataset::Kills) || (spool.is_none() && kill_cohort)) && (spool.is_some() || self.cached_datasets[Dataset::Kills].is_none());
         let load_damage = needs(Dataset::Damage);
         let load_resources = (requested(Dataset::ResourceEvents)
             || requested(Dataset::SoulBagPickups))
-            && (self.cached_datasets[Dataset::ResourceEvents].is_none()
+            && (spool.is_some() || self.cached_datasets[Dataset::ResourceEvents].is_none()
                 || self.cached_datasets[Dataset::SoulBagPickups].is_none());
         let load_flex_slots = needs(Dataset::FlexSlots);
         let load_ability_upgrades =
-            controller_cohort && self.cached_datasets[Dataset::AbilityUpgrades].is_none();
+            (requested(Dataset::AbilityUpgrades) || (spool.is_none() && controller_cohort)) && (spool.is_some() || self.cached_datasets[Dataset::AbilityUpgrades].is_none());
         let load_item_purchases =
-            controller_cohort && self.cached_datasets[Dataset::ItemPurchases].is_none();
-        let load_chat = controller_cohort && self.cached_datasets[Dataset::Chat].is_none();
+            (requested(Dataset::ItemPurchases) || (spool.is_none() && controller_cohort)) && (spool.is_some() || self.cached_datasets[Dataset::ItemPurchases].is_none());
+        let load_chat = (requested(Dataset::Chat) || (spool.is_none() && controller_cohort)) && (spool.is_some() || self.cached_datasets[Dataset::Chat].is_none());
         let load_objectives = needs(Dataset::Objectives);
         let load_mid_boss = needs(Dataset::MidBoss);
         let load_troopers = needs(Dataset::Troopers);
@@ -334,6 +340,7 @@ impl Demo {
         class_names.extend(endpoint_classes.iter().map(String::as_str));
         let class_filter: std::collections::HashSet<&str> = class_names.into_iter().collect();
         let mut resource_rows = Vec::new();
+        let mut resource_sequence = 0u64;
         let mut soul_bag_rows = Vec::new();
         let mut resource_decode_error = None;
 
@@ -350,6 +357,7 @@ impl Demo {
             attacker_hero_id: i64,
             attacker_endpoint: Option<(i32, u32, String)>,
             victim_endpoint: Option<(i32, u32, String)>,
+            optional_breakable_sequence:Option<u64>,
         }
         let mut raw_damage_events = Vec::new();
         let mut entity_to_hero: HashMap<i32, i64> = HashMap::new();
@@ -391,6 +399,11 @@ impl Demo {
         let mut obj_entity_serial: Vec<u32> = Vec::new();
         // Key by entity lifetime, not just a reusable slot index.
         let mut obj_prev: HashMap<boon_parser::EntityId, (i64, i64, i64)> = HashMap::new();
+        let obj_prev_disk = if spool.is_some() && load_objectives {
+            let disk=rusqlite::Connection::open(spool.as_ref().unwrap().root().join("objective-history.sqlite3")).map_err(|e|InvalidDemoError::new_err(e.to_string()))?;
+            disk.execute_batch("PRAGMA cache_size=-1024; PRAGMA journal_mode=OFF; CREATE TABLE previous(entity INTEGER,serial INTEGER,hp INTEGER,max_hp INTEGER,phase INTEGER,PRIMARY KEY(entity,serial)) WITHOUT ROWID; BEGIN").map_err(|e|InvalidDemoError::new_err(e.to_string()))?;
+            Some(std::sync::Mutex::new(disk))
+        } else {None};
         // Patron phase key
         let mut patron_phase_key: Option<u64> = None;
         // ── Column vectors for mid_boss ──
@@ -404,6 +417,10 @@ impl Demo {
         let mut ip_steam_ids: Vec<Option<u64>> = Vec::new();
         let mut ip_ability_ids: Vec<u32> = Vec::new();
         let mut ip_changes: Vec<String> = Vec::new();
+        let mut ip_change_codes: Vec<Option<i32>> = Vec::new();
+        let mut ip_raw_abilities:Vec<Option<u32>>=Vec::new();
+        let mut ip_slots:Vec<Option<i32>>=Vec::new();
+        let mut optional_purchase_error:Option<String>=None;
 
         // ── Column vectors for neutrals (change-detected) ──
         let mut nt_tick: Vec<i32> = Vec::new();
@@ -513,6 +530,9 @@ impl Demo {
         // ── Column vectors for urn ──
         let mut urn_tick: Vec<i32> = Vec::new();
         let mut urn_event: Vec<String> = Vec::new();
+        let mut urn_steam:Vec<Option<u64>>=Vec::new();
+        let mut urn_handles:Vec<Option<u32>>=Vec::new();
+        let mut optional_urn_owners:HashMap<u32,u64>=HashMap::new();
         let mut urn_hero_id: Vec<i64> = Vec::new();
         let mut urn_team_num: Vec<i64> = Vec::new();
         let mut urn_x: Vec<f32> = Vec::new();
@@ -566,10 +586,17 @@ impl Demo {
         let (mut am_state, mut urn_state) = if load_active_modifiers || load_urn {
             let version = replay_catalog_version(game_directory.as_deref()).ok_or_else(||
                 InvalidDemoError::new_err("Active modifier rules require a unique recorded client version; no latest-version catalog was substituted"))?;
-            let directory = boon_parser::data::catalog_dir(Some(&version))
-                .map_err(|error| InvalidDemoError::new_err(error.to_string()))?;
-            let catalog = boon_parser::hero_stats::StatCatalog::from_directory(&directory)
-                .map_err(|error| InvalidDemoError::new_err(error.to_string()))?;
+            let catalog = match crate::replay_catalog::from_environment(&version)
+                .map_err(InvalidDemoError::new_err)?
+            {
+                Some(catalog) => catalog,
+                None => {
+                    let directory = boon_parser::data::catalog_dir(Some(&version))
+                        .map_err(|error| InvalidDemoError::new_err(error.to_string()))?;
+                    boon_parser::hero_stats::StatCatalog::from_directory(&directory)
+                        .map_err(|error| InvalidDemoError::new_err(error.to_string()))?
+                }
+            };
             let urn = if load_urn {
                 Some(
                     boon_parser::urn::UrnState::with_catalog(&catalog)
@@ -754,6 +781,7 @@ impl Demo {
 
         macro_rules! collect_entity_data {
             ($ctx:expr) => {
+                if optional_events {optional_breakables.lifecycle($ctx);}
                 if load_sinners_sacrifice
                     && sn_pending_tick.is_some()
                     && sn_pending_tick != Some($ctx.tick())
@@ -1201,12 +1229,14 @@ impl Demo {
                         let phase = if is_patron { entity.get_i64(patron_phase_key) } else { 0 };
                         let cur = (hp, max_hp, phase);
                         let id = entity.id();
-                        let changed = match obj_prev.get(&id) {
-                            None => true,
-                            Some(prev) => *prev != cur,
-                        };
+                        let changed = if let Some(disk)=&obj_prev_disk {
+                            use rusqlite::OptionalExtension;
+                            let disk=disk.lock().expect("objective history lock poisoned");
+                            let previous:Option<(i64,i64,i64)>=disk.prepare_cached("SELECT hp,max_hp,phase FROM previous WHERE entity=? AND serial=?").expect("objective history statement failed").query_row(rusqlite::params![id.index,id.serial],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional().expect("objective history read failed");
+                            if previous!=Some(cur) {disk.prepare_cached("INSERT OR REPLACE INTO previous VALUES (?,?,?,?,?)").expect("objective history statement failed").execute(rusqlite::params![id.index,id.serial,hp,max_hp,phase]).expect("objective history write failed");true} else {false}
+                        } else {obj_prev.get(&id).is_none_or(|previous|*previous!=cur)};
                         if changed {
-                            obj_prev.insert(id, cur);
+                            if obj_prev_disk.is_none() {obj_prev.insert(id, cur);}
                             obj_tick.push($ctx.tick());
                             obj_type.push(otype.to_string());
                             obj_team_num.push(entity.get_i64(team_key));
@@ -1507,6 +1537,13 @@ impl Demo {
                         if change.kind != boon_parser::urn::UrnEventKind::PickedUp {
                             urn_owners.remove(&change.parent);
                         }
+                        if optional_events {
+                            let steam=$ctx.entities().get_by_handle(change.parent).and_then(|p|optional_breakables.verified_actor($ctx,p))
+                                .or_else(||optional_urn_owners.get(&change.parent).copied());
+                            urn_steam.push(steam);urn_handles.push(Some(change.parent));
+                            if change.kind==boon_parser::urn::UrnEventKind::PickedUp {if let Some(steam)=steam {optional_urn_owners.insert(change.parent,steam);}}
+                            else {optional_urn_owners.remove(&change.parent);}
+                        }
                         urn_tick.push($ctx.tick());
                         urn_event.push(change.kind.as_str().to_owned());
                         urn_hero_id.push(hero_id);
@@ -1515,7 +1552,9 @@ impl Demo {
                         urn_y.push(position[1]);
                         urn_z.push(position[2]);
                     }
+                    if optional_events {urn_trigger_prev.retain(|id,_|$ctx.entities().get(id.index).is_some_and(|e|e.id()==*id));}
                     for (event, team, position) in trigger_events {
+                        if optional_events {urn_steam.push(None);urn_handles.push(None);}
                         urn_tick.push($ctx.tick());
                         urn_event.push(event.to_owned());
                         urn_hero_id.push(0);
@@ -1734,13 +1773,458 @@ impl Demo {
             };
         }
 
+        let cache = &mut self.cached_datasets;
+        let parser = &self.parser;
+        let mut spool_error: Option<PyErr> = None;
+        let mut batch_source_bytes=0usize;
+        macro_rules! flush_columns { () => { (|| -> PyResult<()> {
+        // ── Build and cache DataFrames ──
+
+        if load_kills {
+            // Decode raw kill events and resolve entity indices to hero IDs
+            let n = raw_kill_events.len();
+            let mut kill_tick: Vec<i32> = Vec::with_capacity(n);
+            let mut victim_hero_id: Vec<i64> = Vec::with_capacity(n);
+            let mut attacker_hero_id: Vec<i64> = Vec::with_capacity(n);
+            let mut assister_builder = ListPrimitiveChunkedBuilder::<Int64Type>::new(
+                "assister_hero_ids".into(),
+                n,
+                4,
+                DataType::Int64,
+            );
+
+            for raw in &raw_kill_events {
+                let msg = raw.message.as_ref().map_err(|e| {
+                    DemoMessageError::new_err(format!("Failed to decode HeroKilled event: {e}"))
+                })?;
+
+                kill_tick.push(raw.tick);
+                victim_hero_id.push(
+                    if spool.is_some() { i64::from(msg.entindex_victim.unwrap_or(-1)) } else { entity_to_hero.get(&msg.entindex_victim.unwrap_or(-1)).copied().unwrap_or(0) },
+                );
+                attacker_hero_id.push(
+                    if spool.is_some() { i64::from(msg.entindex_attacker.unwrap_or(-1)) } else { entity_to_hero.get(&msg.entindex_attacker.unwrap_or(-1)).copied().unwrap_or(0) },
+                );
+
+                let assister_ids: Vec<i64> = msg
+                    .entindex_assisters
+                    .iter()
+                    .filter_map(|idx| if spool.is_some() { Some(i64::from(*idx)) } else { entity_to_hero.get(idx).copied() })
+                    .collect();
+                assister_builder.append_slice(&assister_ids);
+            }
+
+            let assister_series = assister_builder.finish().into_column();
+            let df = df_from_columns(vec![
+                Column::new("tick".into(), kill_tick),
+                Column::new("victim_hero_id".into(), victim_hero_id),
+                Column::new("attacker_hero_id".into(), attacker_hero_id),
+                assister_series,
+            ])
+            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
+            if let Some(sink) = spool.as_deref_mut() { sink.write(Dataset::Kills.as_str(), df)?; } else { cache[Dataset::Kills] = Some(df); }
+        }
+
+        if load_resources {
+            if let Some(error) = resource_decode_error.take() {
+                return Err(DemoMessageError::new_err(format!(
+                    "Failed to decode currency/bag event: {error}"
+                )));
+            }
+            crate::resource_events::link_bags(&mut resource_rows, &soul_bag_rows);
+            let bags = crate::resource_events::bag_frame(&soul_bag_rows).map_err(|error| InvalidDemoError::new_err(error.to_string()))?;
+            let resources = crate::resource_events::frame(&resource_rows).map_err(|error| InvalidDemoError::new_err(error.to_string()))?;
+            if let Some(sink) = spool.as_deref_mut() { sink.write("soul_bag_pickups", bags)?; sink.write("resource_events", resources)?; } else { cache[Dataset::SoulBagPickups] = Some(bags); cache[Dataset::ResourceEvents] = Some(resources); }
+            resource_rows.clear(); soul_bag_rows.clear();
+        }
+        if load_damage {
+            // Build damage rows with the hero identities captured at each event.
+            let n = raw_damage_events.len();
+            let mut dmg_tick: Vec<i32> = Vec::with_capacity(n);
+            let mut dmg_damage: Vec<i32> = Vec::with_capacity(n);
+            let mut dmg_pre_damage: Vec<f32> = Vec::with_capacity(n);
+            let mut dmg_victim_hero_id: Vec<i64> = Vec::with_capacity(n);
+            let mut dmg_attacker_hero_id: Vec<i64> = Vec::with_capacity(n);
+            let mut dmg_victim_health_new: Vec<i32> = Vec::with_capacity(n);
+            let mut dmg_hitgroup_id: Vec<i32> = Vec::with_capacity(n);
+            let mut dmg_crit_damage: Vec<f32> = Vec::with_capacity(n);
+            let mut dmg_attacker_class: Vec<u32> = Vec::with_capacity(n);
+            let mut dmg_victim_class: Vec<u32> = Vec::with_capacity(n);
+            let mut dmg_victim_entity_id: Vec<i32> = Vec::with_capacity(n);
+            let mut dmg_ability_id: Vec<u32> = Vec::with_capacity(n);
+            let mut dmg_type: Vec<i32> = Vec::with_capacity(n);
+            let mut dmg_citadel_type: Vec<i32> = Vec::with_capacity(n);
+            let mut dmg_flags: Vec<u64> = Vec::with_capacity(n);
+            let mut dmg_is_melee: Vec<bool> = Vec::with_capacity(n);
+            let mut dmg_melee_type: Vec<Option<&'static str>> = Vec::with_capacity(n);
+            let mut dmg_absorbed: Vec<Option<f32>> = Vec::with_capacity(n);
+            let mut dmg_shield_new: Vec<Option<i32>> = Vec::with_capacity(n);
+            let mut dmg_shield_max: Vec<Option<i32>> = Vec::with_capacity(n);
+            let mut dmg_server_tick: Vec<Option<i32>> = Vec::with_capacity(n);
+
+            for raw in &raw_damage_events {
+                let msg = raw.event.message.as_ref().map_err(|e| {
+                    DemoMessageError::new_err(format!("Failed to decode Damage event: {e}"))
+                })?;
+
+                dmg_tick.push(raw.event.tick);
+                dmg_damage.push(msg.damage.unwrap_or(0));
+                dmg_pre_damage.push(msg.pre_damage.unwrap_or(0.0));
+                dmg_victim_entity_id.push(msg.entindex_victim.unwrap_or(-1));
+                dmg_victim_hero_id.push(raw.victim_hero_id);
+                dmg_attacker_hero_id.push(raw.attacker_hero_id);
+                dmg_victim_health_new.push(msg.victim_health_new.unwrap_or(0));
+                dmg_hitgroup_id.push(msg.hitgroup_id.unwrap_or(0));
+                dmg_crit_damage.push(msg.crit_damage.unwrap_or(0.0));
+                dmg_attacker_class.push(msg.attacker_class.unwrap_or(0));
+                dmg_victim_class.push(msg.victim_class.unwrap_or(0));
+                let ability_id = msg.ability_id.unwrap_or(0);
+                let citadel_type = msg.citadel_type.unwrap_or(0);
+                let damage_flags = msg.flags.unwrap_or(0);
+                let (is_melee, melee_type) = classify_melee_damage(citadel_type, damage_flags);
+                dmg_ability_id.push(ability_id);
+                dmg_type.push(msg.r#type.unwrap_or(0));
+                dmg_citadel_type.push(citadel_type);
+                dmg_flags.push(damage_flags);
+                dmg_is_melee.push(is_melee);
+                dmg_melee_type.push(melee_type);
+                dmg_absorbed.push(msg.damage_absorbed);
+                dmg_shield_new.push(msg.victim_shield_new);
+                dmg_shield_max.push(msg.victim_shield_max);
+                dmg_server_tick.push(msg.server_tick);
+            }
+
+            let mut df = df_from_columns(vec![
+                Column::new("tick".into(), dmg_tick),
+                Column::new("damage".into(), dmg_damage),
+                Column::new("pre_damage".into(), dmg_pre_damage),
+                Column::new("victim_hero_id".into(), dmg_victim_hero_id),
+                Column::new("attacker_hero_id".into(), dmg_attacker_hero_id),
+                Column::new("victim_health_new".into(), dmg_victim_health_new),
+                Column::new("hitgroup_id".into(), dmg_hitgroup_id),
+                Column::new("crit_damage".into(), dmg_crit_damage),
+                Column::new("attacker_class".into(), dmg_attacker_class),
+                Column::new("victim_class".into(), dmg_victim_class),
+                Column::new("victim_entity_id".into(), dmg_victim_entity_id),
+                Column::new("ability_id".into(), dmg_ability_id),
+                Column::new("damage_type".into(), dmg_type),
+                Column::new("citadel_type".into(), dmg_citadel_type),
+                Column::new("damage_flags".into(), dmg_flags),
+                Column::new("is_melee".into(), dmg_is_melee),
+                Column::new("melee_type".into(), dmg_melee_type),
+                Column::new("damage_absorbed".into(), dmg_absorbed),
+                Column::new("victim_shield_new".into(), dmg_shield_new),
+                Column::new("victim_shield_max".into(), dmg_shield_max),
+                Column::new("server_tick".into(), dmg_server_tick),
+                Column::new(
+                    "attacker_entity_index".into(),
+                    raw_damage_events
+                        .iter()
+                        .map(|r| r.attacker_endpoint.as_ref().map(|e| e.0))
+                        .collect::<Vec<_>>(),
+                ),
+                Column::new(
+                    "attacker_entity_serial".into(),
+                    raw_damage_events
+                        .iter()
+                        .map(|r| r.attacker_endpoint.as_ref().map(|e| e.1))
+                        .collect::<Vec<_>>(),
+                ),
+                Column::new(
+                    "attacker_entity_class".into(),
+                    raw_damage_events
+                        .iter()
+                        .map(|r| r.attacker_endpoint.as_ref().map(|e| e.2.as_str()))
+                        .collect::<Vec<_>>(),
+                ),
+                Column::new(
+                    "victim_entity_index".into(),
+                    raw_damage_events
+                        .iter()
+                        .map(|r| r.victim_endpoint.as_ref().map(|e| e.0))
+                        .collect::<Vec<_>>(),
+                ),
+                Column::new(
+                    "victim_entity_serial".into(),
+                    raw_damage_events
+                        .iter()
+                        .map(|r| r.victim_endpoint.as_ref().map(|e| e.1))
+                        .collect::<Vec<_>>(),
+                ),
+                Column::new(
+                    "victim_entity_class".into(),
+                    raw_damage_events
+                        .iter()
+                        .map(|r| r.victim_endpoint.as_ref().map(|e| e.2.as_str()))
+                        .collect::<Vec<_>>(),
+                ),
+            ])
+            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
+            if optional_events {df.with_column(Column::new("optional_breakable_sequence".into(),raw_damage_events.iter().map(|r|r.optional_breakable_sequence).collect::<Vec<_>>())).map_err(|e|InvalidDemoError::new_err(e.to_string()))?;}
+            if let Some(sink) = spool.as_deref_mut() { sink.write(Dataset::Damage.as_str(), df)?; } else { cache[Dataset::Damage] = Some(df); }
+        }
+
+        if load_abilities {
+            let df = df_from_columns(vec![
+                Column::new("tick".into(), std::mem::take(&mut ability_ticks)),
+                Column::new("hero_id".into(), std::mem::take(&mut ability_hero_ids)),
+                Column::new("ability".into(), std::mem::take(&mut ability_names)),
+            ])
+            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
+            if let Some(sink) = spool.as_deref_mut() { sink.write(Dataset::Abilities.as_str(), df)?; } else { cache[Dataset::Abilities] = Some(df); }
+        }
+
+        if load_flex_slots {
+            let df = df_from_columns(vec![
+                Column::new("tick".into(), std::mem::take(&mut flex_ticks)),
+                Column::new("team_num".into(), std::mem::take(&mut flex_team_nums)),
+            ])
+            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
+            if let Some(sink) = spool.as_deref_mut() { sink.write(Dataset::FlexSlots.as_str(), df)?; } else { cache[Dataset::FlexSlots] = Some(df); }
+        }
+
+        if load_ability_upgrades {
+            let df = df_from_columns(vec![
+                Column::new("tick".into(), std::mem::take(&mut au_ticks)),
+                Column::new("hero_id".into(), std::mem::take(&mut au_hero_ids)),
+                Column::new("ability_id".into(), std::mem::take(&mut au_ability_ids)),
+                Column::new("tier".into(), std::mem::take(&mut au_tier)),
+            ])
+            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
+            if let Some(sink) = spool.as_deref_mut() { sink.write(Dataset::AbilityUpgrades.as_str(), df)?; } else { cache[Dataset::AbilityUpgrades] = Some(df); }
+        }
+
+        if load_item_purchases {
+            let mut df = df_from_columns(vec![
+                Column::new("tick".into(), std::mem::take(&mut ip_ticks)),
+                Column::new("steam_id".into(), std::mem::take(&mut ip_steam_ids)),
+                Column::new("hero_id".into(), std::mem::take(&mut ip_hero_ids)),
+                Column::new("ability_id".into(), std::mem::take(&mut ip_ability_ids)),
+                Column::new("change".into(), std::mem::take(&mut ip_changes)),
+            ])
+            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
+            if optional_events {
+                df.with_column(Column::new("ability_id".into(),std::mem::take(&mut ip_raw_abilities))).map_err(|e|InvalidDemoError::new_err(e.to_string()))?;
+                df.with_column(Column::new("purchaser_player_slot".into(),std::mem::take(&mut ip_slots))).map_err(|e|InvalidDemoError::new_err(e.to_string()))?;
+                df.with_column(Column::new("change_code".into(),std::mem::take(&mut ip_change_codes))).map_err(|e|InvalidDemoError::new_err(e.to_string()))?;}
+            if let Some(sink) = spool.as_deref_mut() { sink.write(Dataset::ItemPurchases.as_str(), df)?; } else { cache[Dataset::ItemPurchases] = Some(df); }
+        }
+
+        if load_chat {
+            let df = df_from_columns(vec![
+                Column::new("tick".into(), std::mem::take(&mut chat_ticks)),
+                Column::new("hero_id".into(), std::mem::take(&mut chat_hero_ids)),
+                Column::new("text".into(), std::mem::take(&mut chat_texts)),
+                Column::new("chat_type".into(), std::mem::take(&mut chat_types)),
+            ])
+            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
+            if let Some(sink) = spool.as_deref_mut() { sink.write(Dataset::Chat.as_str(), df)?; } else { cache[Dataset::Chat] = Some(df); }
+        }
+
+        if load_objectives {
+            let df = df_from_columns(vec![
+                Column::new("tick".into(), std::mem::take(&mut obj_tick)),
+                Column::new("objective_type".into(), std::mem::take(&mut obj_type)),
+                Column::new("team_num".into(), std::mem::take(&mut obj_team_num)),
+                Column::new("lane".into(), std::mem::take(&mut obj_lane)),
+                Column::new("health".into(), std::mem::take(&mut obj_health)),
+                Column::new("max_health".into(), std::mem::take(&mut obj_max_health)),
+                Column::new("phase".into(), std::mem::take(&mut obj_phase)),
+                Column::new("x".into(), std::mem::take(&mut obj_x)),
+                Column::new("y".into(), std::mem::take(&mut obj_y)),
+                Column::new("z".into(), std::mem::take(&mut obj_z)),
+                Column::new("entity_id".into(), std::mem::take(&mut obj_entity_id)),
+                Column::new("entity_serial".into(), std::mem::take(&mut obj_entity_serial)),
+            ])
+            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
+            if let Some(sink) = spool.as_deref_mut() { sink.write(Dataset::Objectives.as_str(), df)?; } else { cache[Dataset::Objectives] = Some(df); }
+        }
+
+        if load_mid_boss {
+            let df = df_from_columns(vec![
+                Column::new("tick".into(), std::mem::take(&mut mb_ticks)),
+                Column::new("team_num".into(), std::mem::take(&mut mb_team_nums)),
+                Column::new("event".into(), std::mem::take(&mut mb_events)),
+            ])
+            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
+            if let Some(sink) = spool.as_deref_mut() { sink.write(Dataset::MidBoss.as_str(), df)?; } else { cache[Dataset::MidBoss] = Some(df); }
+        }
+
+        if load_neutrals {
+            let df = df_from_columns(vec![
+                Column::new("tick".into(), std::mem::take(&mut nt_tick)),
+                Column::new("team_num".into(), std::mem::take(&mut nt_team_num)),
+                Column::new("health".into(), std::mem::take(&mut nt_health)),
+                Column::new("max_health".into(), std::mem::take(&mut nt_max_health)),
+                Column::new("x".into(), std::mem::take(&mut nt_x)),
+                Column::new("y".into(), std::mem::take(&mut nt_y)),
+                Column::new("z".into(), std::mem::take(&mut nt_z)),
+                Column::new("entity_id".into(), std::mem::take(&mut nt_entity_id)),
+            ])
+            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
+            if let Some(sink) = spool.as_deref_mut() { sink.write(Dataset::Neutrals.as_str(), df)?; } else { cache[Dataset::Neutrals] = Some(df); }
+        }
+
+        if load_breakables {
+            let df = df_from_columns(vec![
+                Column::new("tick".into(), std::mem::take(&mut bk_tick)),
+                Column::new("event".into(), std::mem::take(&mut bk_event)),
+                Column::new("entity_id".into(), std::mem::take(&mut bk_entity_id)),
+                Column::new("entity_serial".into(), std::mem::take(&mut bk_entity_serial)),
+                Column::new("subclass_id".into(), std::mem::take(&mut bk_subclass_id)),
+                Column::new("subclass_name".into(), std::mem::take(&mut bk_subclass_name)),
+                Column::new("team_num".into(), std::mem::take(&mut bk_team_num)),
+                Column::new("x".into(), std::mem::take(&mut bk_x)),
+                Column::new("y".into(), std::mem::take(&mut bk_y)),
+                Column::new("z".into(), std::mem::take(&mut bk_z)),
+            ])
+            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
+            if let Some(sink) = spool.as_deref_mut() { sink.write(Dataset::Breakables.as_str(), df)?; } else { cache[Dataset::Breakables] = Some(df); }
+        }
+
+        if load_sinners_sacrifice {
+            let df = df_from_columns(vec![
+                Column::new("tick".into(), std::mem::take(&mut sn_tick)),
+                Column::new("event".into(), std::mem::take(&mut sn_event)),
+                Column::new("entity_id".into(), std::mem::take(&mut sn_entity_id)),
+                Column::new("entity_serial".into(), std::mem::take(&mut sn_entity_serial)),
+                Column::new("attacker_hero_id".into(), std::mem::take(&mut sn_attacker_hero_id)),
+                Column::new("damage".into(), std::mem::take(&mut sn_damage)),
+                Column::new("health".into(), std::mem::take(&mut sn_health)),
+                Column::new("max_health".into(), std::mem::take(&mut sn_max_health)),
+                Column::new("team_num".into(), std::mem::take(&mut sn_team_num)),
+                Column::new("x".into(), std::mem::take(&mut sn_x)),
+                Column::new("y".into(), std::mem::take(&mut sn_y)),
+                Column::new("z".into(), std::mem::take(&mut sn_z)),
+            ])
+            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
+            if let Some(sink) = spool.as_deref_mut() { sink.write(Dataset::SinnersSacrifice.as_str(), df)?; } else { cache[Dataset::SinnersSacrifice] = Some(df); }
+        }
+
+        if load_stat_modifier_events {
+            let df = df_from_columns(vec![
+                Column::new("tick".into(), std::mem::take(&mut sm_tick)),
+                Column::new("hero_id".into(), std::mem::take(&mut sm_hero_id)),
+                Column::new("stat_type".into(), std::mem::take(&mut sm_stat_type)),
+                Column::new("amount".into(), std::mem::take(&mut sm_amount)),
+            ])
+            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
+            if let Some(sink) = spool.as_deref_mut() { sink.write(Dataset::StatModifierEvents.as_str(), df)?; } else { cache[Dataset::StatModifierEvents] = Some(df); }
+        }
+
+        if load_active_modifiers {
+            let df = df_from_columns(vec![
+                Column::new("tick".into(), std::mem::take(&mut am_tick)),
+                Column::new("hero_id".into(), std::mem::take(&mut am_hero_id)),
+                Column::new("event".into(), std::mem::take(&mut am_event)),
+                Column::new("serial".into(), std::mem::take(&mut am_serial)),
+                Column::new("modifier_id".into(), std::mem::take(&mut am_modifier_id)),
+                Column::new("ability_id".into(), std::mem::take(&mut am_ability_id)),
+                Column::new("duration".into(), std::mem::take(&mut am_duration)),
+                Column::new("caster_hero_id".into(), std::mem::take(&mut am_caster_hero_id)),
+                Column::new("stacks".into(), std::mem::take(&mut am_stacks)),
+            ])
+            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
+            if let Some(sink) = spool.as_deref_mut() { sink.write(Dataset::ActiveModifiers.as_str(), df)?; } else { cache[Dataset::ActiveModifiers] = Some(df); }
+        }
+
+        if load_ability_ticks {
+            let df = df_from_columns(vec![
+                Column::new("tick".into(), std::mem::take(&mut at_tick)),
+                Column::new("hero_id".into(), std::mem::take(&mut at_hero_id)),
+                Column::new("ability_id".into(), std::mem::take(&mut at_ability_id)),
+                Column::new("slot".into(), std::mem::take(&mut at_slot)),
+                Column::new("cooldown_start".into(), std::mem::take(&mut at_cooldown_start)),
+                Column::new("cooldown_end".into(), std::mem::take(&mut at_cooldown_end)),
+                Column::new("remaining_charges".into(), std::mem::take(&mut at_remaining_charges)),
+                Column::new("charge_recharge_start".into(), std::mem::take(&mut at_charge_recharge_start)),
+                Column::new("charge_recharge_end".into(), std::mem::take(&mut at_charge_recharge_end)),
+            ])
+            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
+            if let Some(sink) = spool.as_deref_mut() { sink.write(Dataset::AbilityTicks.as_str(), df)?; } else { cache[Dataset::AbilityTicks] = Some(df); }
+        }
+
+        if load_urn {
+            let mut df = df_from_columns(vec![
+                Column::new("tick".into(), std::mem::take(&mut urn_tick)),
+                Column::new("event".into(), std::mem::take(&mut urn_event)),
+                Column::new("hero_id".into(), std::mem::take(&mut urn_hero_id)),
+                Column::new("team_num".into(), std::mem::take(&mut urn_team_num)),
+                Column::new("x".into(), std::mem::take(&mut urn_x)),
+                Column::new("y".into(), std::mem::take(&mut urn_y)),
+                Column::new("z".into(), std::mem::take(&mut urn_z)),
+            ])
+            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
+            if optional_events {df.with_column(Column::new("evidence_basis".into(),urn_handles.iter().map(|handle|if handle.is_some(){"effective_modifier_carrier_transition"}else{"delivery_trigger_state"}).collect::<Vec<_>>())).map_err(|e|InvalidDemoError::new_err(e.to_string()))?;df.with_column(Column::new("steam_id".into(),std::mem::take(&mut urn_steam))).map_err(|e|InvalidDemoError::new_err(e.to_string()))?;df.with_column(Column::new("carrier_handle".into(),std::mem::take(&mut urn_handles))).map_err(|e|InvalidDemoError::new_err(e.to_string()))?;}
+            if let Some(sink) = spool.as_deref_mut() { sink.write(Dataset::Urn.as_str(), df)?; } else { cache[Dataset::Urn] = Some(df); }
+        }
+
+        if load_street_brawl_ticks {
+            let df = df_from_columns(vec![
+                Column::new("tick".into(), std::mem::take(&mut sbt_tick)),
+                Column::new("round".into(), std::mem::take(&mut sbt_round)),
+                Column::new("state".into(), std::mem::take(&mut sbt_state)),
+                Column::new("amber_score".into(), std::mem::take(&mut sbt_amber_score)),
+                Column::new("sapphire_score".into(), std::mem::take(&mut sbt_sapphire_score)),
+                Column::new("buy_countdown".into(), std::mem::take(&mut sbt_buy_countdown)),
+                Column::new("next_state_time".into(), std::mem::take(&mut sbt_next_state_time)),
+                Column::new("state_start_time".into(), std::mem::take(&mut sbt_state_start_time)),
+                Column::new("non_combat_time".into(), std::mem::take(&mut sbt_non_combat_time)),
+            ])
+            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
+            if let Some(sink) = spool.as_deref_mut() { sink.write(Dataset::StreetBrawlTicks.as_str(), df)?; } else { cache[Dataset::StreetBrawlTicks] = Some(df); }
+        }
+
+        if load_street_brawl_rounds {
+            let df = df_from_columns(vec![
+                Column::new("round".into(), std::mem::take(&mut sbr_round)),
+                Column::new("tick".into(), std::mem::take(&mut sbr_tick)),
+                Column::new("scoring_team".into(), std::mem::take(&mut sbr_scoring_team)),
+                Column::new("amber_score".into(), std::mem::take(&mut sbr_amber_score)),
+                Column::new("sapphire_score".into(), std::mem::take(&mut sbr_sapphire_score)),
+            ])
+            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
+            if let Some(sink) = spool.as_deref_mut() { sink.write(Dataset::StreetBrawlRounds.as_str(), df)?; } else { cache[Dataset::StreetBrawlRounds] = Some(df); }
+        }
+
+        if load_rift {
+            let df = df_from_columns(vec![
+                Column::new("rift_num".into(), std::mem::take(&mut rift_num)),
+                Column::new("announce_tick".into(), std::mem::take(&mut rift_announce_tick)),
+                Column::new("active_tick".into(), std::mem::take(&mut rift_active_tick)),
+                Column::new("capture_tick".into(), std::mem::take(&mut rift_capture_tick)),
+                Column::new("expire_tick".into(), std::mem::take(&mut rift_expire_tick)),
+                Column::new("winning_team".into(), std::mem::take(&mut rift_winning_team)),
+                Column::new("lane".into(), std::mem::take(&mut rift_lane)),
+                Column::new("x".into(), std::mem::take(&mut rift_x)),
+                Column::new("y".into(), std::mem::take(&mut rift_y)),
+                Column::new("z".into(), std::mem::take(&mut rift_z)),
+            ])
+            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
+            if let Some(sink) = spool.as_deref_mut() { sink.write(Dataset::Rift.as_str(), df)?; } else { cache[Dataset::Rift] = Some(df); }
+        }
+
+        if optional_events {if let Some(sink)=spool.as_deref_mut() {
+            sink.write("breakable_events",optional_breakables.frame().map_err(|e|InvalidDemoError::new_err(e.to_string()))?)?;
+        }}
+        raw_kill_events.clear(); raw_damage_events.clear();batch_source_bytes=0;
+            Ok(())
+        })() }; }
+        macro_rules! maybe_flush { () => {
+            if let Some(sink)=spool.as_deref_mut() {if let Err(error)=sink.check_cancel() {spool_error=Some(error);}}
+            if spool.is_some() && (batch_source_bytes>=4*1024*1024 || raw_kill_events.len() + raw_damage_events.len() + resource_rows.len() + soul_bag_rows.len() + ability_ticks.len() + au_ticks.len() + obj_tick.len() + nt_tick.len() + sn_tick.len() + am_tick.len() + at_tick.len() + mb_ticks.len() + ip_ticks.len() + urn_tick.len() + optional_breakables.rows.len() >= 1024) {
+                if let Err(error) = flush_columns!() { spool_error = Some(error); }
+            }
+        }; }
         // ── Run the parse pass ──
         if need_events {
             py.detach(|| {
-                self.parser.run_to_end_with_event_types_filtered(
+                parser.try_run_to_end_with_event_types_filtered(
                     &class_filter,
                     &event_types,
                     |ctx, events| {
+                        if spool_error.is_some() { return Err(crate::bounded_spool::aborted()); }
+                        batch_source_bytes=batch_source_bytes.saturating_add(events.iter().map(|event|event.payload.len()).sum::<usize>());
                         collect_entity_data!(ctx);
 
                         for event in events {
@@ -1804,7 +2288,7 @@ impl Demo {
                                             });
                                         resource_rows.push(crate::resource_events::Row {
                                             tick: event.tick,
-                                            sequence: resource_rows.len() as u64,
+                                            sequence: resource_sequence,
                                             steam_id: steam,
                                             controller_index: ctrl.map(|entity| entity.index),
                                             source,
@@ -1822,6 +2306,7 @@ impl Demo {
                                             bag_status: "unresolved",
                                             message: msg,
                                         });
+                                        resource_sequence += 1;
                                     }
                                     Err(error) => {
                                         resource_decode_error = Some(error.to_string());
@@ -1933,7 +2418,9 @@ impl Demo {
                                         .as_ref()
                                         .ok()
                                         .and_then(|msg| endpoint(msg.entindex_victim));
+                                    let optional_breakable_sequence=if optional_events {message.as_ref().ok().and_then(|msg|optional_breakables.damage(ctx,event.tick,msg))}else{None};
                                     raw_damage_events.push(RawDamageEvent {
+                                        optional_breakable_sequence,
                                         attacker_endpoint,
                                         victim_endpoint,
                                         event: RawEvent {
@@ -1991,10 +2478,10 @@ impl Demo {
                             // Collect AbilitiesChanged events (msg_type 309) for item_purchases
                             if load_item_purchases
                                 && event.msg_type == Msg::KEUserMsgAbilitiesChanged as u32
-                                && let Ok(msg) =
-                                    boon_proto::proto::CCitadelUserMsgAbilitiesChanged::decode(
-                                        event.payload.as_slice(),
-                                    )
+                                && let Some(msg) = match boon_proto::proto::CCitadelUserMsgAbilitiesChanged::decode(event.payload.as_slice()) {
+                                    Ok(msg)=>Some(msg),
+                                    Err(error)=>{if optional_events {optional_purchase_error=Some(error.to_string());}None}
+                                }
                             {
                                 let hero_id = boon_parser::hero_id_for_player_slot(
                                     ctx.entities(),
@@ -2013,6 +2500,7 @@ impl Demo {
                                     .and_then(|index| ctx.entities().get(index))
                                     .filter(|entity| {
                                         entity.class_name.as_ref() == "CCitadelPlayerController"
+                                            && (!optional_events || crate::optional_events::exact_generation(event.tick,ctx.tick(),entity.index,entity.serial,ctx.entities().entity_changes().iter().map(|change|(change.index,change.serial))))
                                     })
                                     .and_then(|entity| {
                                         ck_steam_id.and_then(|key| entity.fields.get(&key))
@@ -2027,6 +2515,7 @@ impl Demo {
                                 ip_steam_ids.push(steam_id);
                                 ip_ability_ids.push(ability_id);
                                 ip_changes.push(change.to_string());
+                                if optional_events {ip_change_codes.push(msg.change);ip_raw_abilities.push(msg.ability_id);ip_slots.push(msg.purchaser_player_slot);}
                             }
                             // Collect ChatMsg events (msg_type 314)
                             if load_chat
@@ -2103,19 +2592,26 @@ impl Demo {
                                 sbr_sapphire_score.push(msg.sapphire_score.unwrap_or(0));
                             }
                         }
+                        maybe_flush!();
+                        if spool_error.is_some() {Err(crate::bounded_spool::aborted())} else {Ok(())}
                     },
                 )
             })
-            .map_err(to_py_err)?;
+            .map_err(|e|spool_error.take().unwrap_or_else(||to_py_err(e)))?;
         } else {
             py.detach(|| {
-                self.parser.run_to_end_filtered(&class_filter, |ctx| {
+                parser.try_run_to_end_filtered(&class_filter, |ctx| {
+                    if spool_error.is_some() { return Err(crate::bounded_spool::aborted()); }
                     collect_entity_data!(ctx);
+                    maybe_flush!();
+                    if spool_error.is_some() {Err(crate::bounded_spool::aborted())} else {Ok(())}
                 })
             })
-            .map_err(to_py_err)?;
+            .map_err(|e|spool_error.take().unwrap_or_else(||to_py_err(e)))?;
         }
 
+        if let Some(error) = spool_error { return Err(error); }
+        if let Some(error)=optional_purchase_error {return Err(DemoMessageError::new_err(format!("Failed to decode optional AbilitiesChanged: {error}")));}
         if load_sinners_sacrifice {
             flush_pending_sinner_hits!();
             if let Some(error) = sn_damage_decode_error {
@@ -2157,435 +2653,17 @@ impl Demo {
             }
         }
 
-        // ── Build and cache DataFrames ──
-
-        if load_kills {
-            // Decode raw kill events and resolve entity indices to hero IDs
-            let n = raw_kill_events.len();
-            let mut kill_tick: Vec<i32> = Vec::with_capacity(n);
-            let mut victim_hero_id: Vec<i64> = Vec::with_capacity(n);
-            let mut attacker_hero_id: Vec<i64> = Vec::with_capacity(n);
-            let mut assister_builder = ListPrimitiveChunkedBuilder::<Int64Type>::new(
-                "assister_hero_ids".into(),
-                n,
-                4,
-                DataType::Int64,
-            );
-
-            for raw in &raw_kill_events {
-                let msg = raw.message.as_ref().map_err(|e| {
-                    DemoMessageError::new_err(format!("Failed to decode HeroKilled event: {e}"))
-                })?;
-
-                kill_tick.push(raw.tick);
-                victim_hero_id.push(
-                    entity_to_hero
-                        .get(&msg.entindex_victim.unwrap_or(-1))
-                        .copied()
-                        .unwrap_or(0),
-                );
-                attacker_hero_id.push(
-                    entity_to_hero
-                        .get(&msg.entindex_attacker.unwrap_or(-1))
-                        .copied()
-                        .unwrap_or(0),
-                );
-
-                let assister_ids: Vec<i64> = msg
-                    .entindex_assisters
-                    .iter()
-                    .filter_map(|idx| entity_to_hero.get(idx).copied())
-                    .collect();
-                assister_builder.append_slice(&assister_ids);
-            }
-
-            let assister_series = assister_builder.finish().into_column();
-            let df = df_from_columns(vec![
-                Column::new("tick".into(), kill_tick),
-                Column::new("victim_hero_id".into(), victim_hero_id),
-                Column::new("attacker_hero_id".into(), attacker_hero_id),
-                assister_series,
-            ])
-            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
-            self.cached_datasets[Dataset::Kills] = Some(df);
-        }
-
-        if load_resources {
-            if let Some(error) = resource_decode_error {
-                return Err(DemoMessageError::new_err(format!(
-                    "Failed to decode currency/bag event: {error}"
-                )));
-            }
-            crate::resource_events::link_bags(&mut resource_rows, &soul_bag_rows);
-            self.cached_datasets[Dataset::SoulBagPickups] = Some(
-                crate::resource_events::bag_frame(&soul_bag_rows)
-                    .map_err(|error| InvalidDemoError::new_err(error.to_string()))?,
-            );
-            self.cached_datasets[Dataset::ResourceEvents] = Some(
-                crate::resource_events::frame(&resource_rows)
-                    .map_err(|error| InvalidDemoError::new_err(error.to_string()))?,
-            );
-        }
-        if load_damage {
-            // Build damage rows with the hero identities captured at each event.
-            let n = raw_damage_events.len();
-            let mut dmg_tick: Vec<i32> = Vec::with_capacity(n);
-            let mut dmg_damage: Vec<i32> = Vec::with_capacity(n);
-            let mut dmg_pre_damage: Vec<f32> = Vec::with_capacity(n);
-            let mut dmg_victim_hero_id: Vec<i64> = Vec::with_capacity(n);
-            let mut dmg_attacker_hero_id: Vec<i64> = Vec::with_capacity(n);
-            let mut dmg_victim_health_new: Vec<i32> = Vec::with_capacity(n);
-            let mut dmg_hitgroup_id: Vec<i32> = Vec::with_capacity(n);
-            let mut dmg_crit_damage: Vec<f32> = Vec::with_capacity(n);
-            let mut dmg_attacker_class: Vec<u32> = Vec::with_capacity(n);
-            let mut dmg_victim_class: Vec<u32> = Vec::with_capacity(n);
-            let mut dmg_victim_entity_id: Vec<i32> = Vec::with_capacity(n);
-            let mut dmg_ability_id: Vec<u32> = Vec::with_capacity(n);
-            let mut dmg_type: Vec<i32> = Vec::with_capacity(n);
-            let mut dmg_citadel_type: Vec<i32> = Vec::with_capacity(n);
-            let mut dmg_flags: Vec<u64> = Vec::with_capacity(n);
-            let mut dmg_is_melee: Vec<bool> = Vec::with_capacity(n);
-            let mut dmg_melee_type: Vec<Option<&'static str>> = Vec::with_capacity(n);
-            let mut dmg_absorbed: Vec<Option<f32>> = Vec::with_capacity(n);
-            let mut dmg_shield_new: Vec<Option<i32>> = Vec::with_capacity(n);
-            let mut dmg_shield_max: Vec<Option<i32>> = Vec::with_capacity(n);
-            let mut dmg_server_tick: Vec<Option<i32>> = Vec::with_capacity(n);
-
-            for raw in &raw_damage_events {
-                let msg = raw.event.message.as_ref().map_err(|e| {
-                    DemoMessageError::new_err(format!("Failed to decode Damage event: {e}"))
-                })?;
-
-                dmg_tick.push(raw.event.tick);
-                dmg_damage.push(msg.damage.unwrap_or(0));
-                dmg_pre_damage.push(msg.pre_damage.unwrap_or(0.0));
-                dmg_victim_entity_id.push(msg.entindex_victim.unwrap_or(-1));
-                dmg_victim_hero_id.push(raw.victim_hero_id);
-                dmg_attacker_hero_id.push(raw.attacker_hero_id);
-                dmg_victim_health_new.push(msg.victim_health_new.unwrap_or(0));
-                dmg_hitgroup_id.push(msg.hitgroup_id.unwrap_or(0));
-                dmg_crit_damage.push(msg.crit_damage.unwrap_or(0.0));
-                dmg_attacker_class.push(msg.attacker_class.unwrap_or(0));
-                dmg_victim_class.push(msg.victim_class.unwrap_or(0));
-                let ability_id = msg.ability_id.unwrap_or(0);
-                let citadel_type = msg.citadel_type.unwrap_or(0);
-                let damage_flags = msg.flags.unwrap_or(0);
-                let (is_melee, melee_type) = classify_melee_damage(citadel_type, damage_flags);
-                dmg_ability_id.push(ability_id);
-                dmg_type.push(msg.r#type.unwrap_or(0));
-                dmg_citadel_type.push(citadel_type);
-                dmg_flags.push(damage_flags);
-                dmg_is_melee.push(is_melee);
-                dmg_melee_type.push(melee_type);
-                dmg_absorbed.push(msg.damage_absorbed);
-                dmg_shield_new.push(msg.victim_shield_new);
-                dmg_shield_max.push(msg.victim_shield_max);
-                dmg_server_tick.push(msg.server_tick);
-            }
-
-            let df = df_from_columns(vec![
-                Column::new("tick".into(), dmg_tick),
-                Column::new("damage".into(), dmg_damage),
-                Column::new("pre_damage".into(), dmg_pre_damage),
-                Column::new("victim_hero_id".into(), dmg_victim_hero_id),
-                Column::new("attacker_hero_id".into(), dmg_attacker_hero_id),
-                Column::new("victim_health_new".into(), dmg_victim_health_new),
-                Column::new("hitgroup_id".into(), dmg_hitgroup_id),
-                Column::new("crit_damage".into(), dmg_crit_damage),
-                Column::new("attacker_class".into(), dmg_attacker_class),
-                Column::new("victim_class".into(), dmg_victim_class),
-                Column::new("victim_entity_id".into(), dmg_victim_entity_id),
-                Column::new("ability_id".into(), dmg_ability_id),
-                Column::new("damage_type".into(), dmg_type),
-                Column::new("citadel_type".into(), dmg_citadel_type),
-                Column::new("damage_flags".into(), dmg_flags),
-                Column::new("is_melee".into(), dmg_is_melee),
-                Column::new("melee_type".into(), dmg_melee_type),
-                Column::new("damage_absorbed".into(), dmg_absorbed),
-                Column::new("victim_shield_new".into(), dmg_shield_new),
-                Column::new("victim_shield_max".into(), dmg_shield_max),
-                Column::new("server_tick".into(), dmg_server_tick),
-                Column::new(
-                    "attacker_entity_index".into(),
-                    raw_damage_events
-                        .iter()
-                        .map(|r| r.attacker_endpoint.as_ref().map(|e| e.0))
-                        .collect::<Vec<_>>(),
-                ),
-                Column::new(
-                    "attacker_entity_serial".into(),
-                    raw_damage_events
-                        .iter()
-                        .map(|r| r.attacker_endpoint.as_ref().map(|e| e.1))
-                        .collect::<Vec<_>>(),
-                ),
-                Column::new(
-                    "attacker_entity_class".into(),
-                    raw_damage_events
-                        .iter()
-                        .map(|r| r.attacker_endpoint.as_ref().map(|e| e.2.as_str()))
-                        .collect::<Vec<_>>(),
-                ),
-                Column::new(
-                    "victim_entity_index".into(),
-                    raw_damage_events
-                        .iter()
-                        .map(|r| r.victim_endpoint.as_ref().map(|e| e.0))
-                        .collect::<Vec<_>>(),
-                ),
-                Column::new(
-                    "victim_entity_serial".into(),
-                    raw_damage_events
-                        .iter()
-                        .map(|r| r.victim_endpoint.as_ref().map(|e| e.1))
-                        .collect::<Vec<_>>(),
-                ),
-                Column::new(
-                    "victim_entity_class".into(),
-                    raw_damage_events
-                        .iter()
-                        .map(|r| r.victim_endpoint.as_ref().map(|e| e.2.as_str()))
-                        .collect::<Vec<_>>(),
-                ),
-            ])
-            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
-            self.cached_datasets[Dataset::Damage] = Some(df);
-        }
-
-        if load_abilities {
-            let df = df_from_columns(vec![
-                Column::new("tick".into(), ability_ticks),
-                Column::new("hero_id".into(), ability_hero_ids),
-                Column::new("ability".into(), ability_names),
-            ])
-            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
-            self.cached_datasets[Dataset::Abilities] = Some(df);
-        }
-
-        if load_flex_slots {
-            let df = df_from_columns(vec![
-                Column::new("tick".into(), flex_ticks),
-                Column::new("team_num".into(), flex_team_nums),
-            ])
-            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
-            self.cached_datasets[Dataset::FlexSlots] = Some(df);
-        }
-
-        if load_ability_upgrades {
-            let df = df_from_columns(vec![
-                Column::new("tick".into(), au_ticks),
-                Column::new("hero_id".into(), au_hero_ids),
-                Column::new("ability_id".into(), au_ability_ids),
-                Column::new("tier".into(), au_tier),
-            ])
-            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
-            self.cached_datasets[Dataset::AbilityUpgrades] = Some(df);
-        }
-
-        if load_item_purchases {
-            let df = df_from_columns(vec![
-                Column::new("tick".into(), ip_ticks),
-                Column::new("steam_id".into(), ip_steam_ids),
-                Column::new("hero_id".into(), ip_hero_ids),
-                Column::new("ability_id".into(), ip_ability_ids),
-                Column::new("change".into(), ip_changes),
-            ])
-            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
-            self.cached_datasets[Dataset::ItemPurchases] = Some(df);
-        }
-
-        if load_chat {
-            let df = df_from_columns(vec![
-                Column::new("tick".into(), chat_ticks),
-                Column::new("hero_id".into(), chat_hero_ids),
-                Column::new("text".into(), chat_texts),
-                Column::new("chat_type".into(), chat_types),
-            ])
-            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
-            self.cached_datasets[Dataset::Chat] = Some(df);
-        }
-
-        if load_objectives {
-            let df = df_from_columns(vec![
-                Column::new("tick".into(), obj_tick),
-                Column::new("objective_type".into(), obj_type),
-                Column::new("team_num".into(), obj_team_num),
-                Column::new("lane".into(), obj_lane),
-                Column::new("health".into(), obj_health),
-                Column::new("max_health".into(), obj_max_health),
-                Column::new("phase".into(), obj_phase),
-                Column::new("x".into(), obj_x),
-                Column::new("y".into(), obj_y),
-                Column::new("z".into(), obj_z),
-                Column::new("entity_id".into(), obj_entity_id),
-                Column::new("entity_serial".into(), obj_entity_serial),
-            ])
-            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
-            self.cached_datasets[Dataset::Objectives] = Some(df);
-        }
-
-        if load_mid_boss {
-            let df = df_from_columns(vec![
-                Column::new("tick".into(), mb_ticks),
-                Column::new("team_num".into(), mb_team_nums),
-                Column::new("event".into(), mb_events),
-            ])
-            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
-            self.cached_datasets[Dataset::MidBoss] = Some(df);
-        }
-
-        if load_neutrals {
-            let df = df_from_columns(vec![
-                Column::new("tick".into(), nt_tick),
-                Column::new("team_num".into(), nt_team_num),
-                Column::new("health".into(), nt_health),
-                Column::new("max_health".into(), nt_max_health),
-                Column::new("x".into(), nt_x),
-                Column::new("y".into(), nt_y),
-                Column::new("z".into(), nt_z),
-                Column::new("entity_id".into(), nt_entity_id),
-            ])
-            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
-            self.cached_datasets[Dataset::Neutrals] = Some(df);
-        }
-
-        if load_breakables {
-            let df = df_from_columns(vec![
-                Column::new("tick".into(), bk_tick),
-                Column::new("event".into(), bk_event),
-                Column::new("entity_id".into(), bk_entity_id),
-                Column::new("entity_serial".into(), bk_entity_serial),
-                Column::new("subclass_id".into(), bk_subclass_id),
-                Column::new("subclass_name".into(), bk_subclass_name),
-                Column::new("team_num".into(), bk_team_num),
-                Column::new("x".into(), bk_x),
-                Column::new("y".into(), bk_y),
-                Column::new("z".into(), bk_z),
-            ])
-            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
-            self.cached_datasets[Dataset::Breakables] = Some(df);
-        }
-
-        if load_sinners_sacrifice {
-            let df = df_from_columns(vec![
-                Column::new("tick".into(), sn_tick),
-                Column::new("event".into(), sn_event),
-                Column::new("entity_id".into(), sn_entity_id),
-                Column::new("entity_serial".into(), sn_entity_serial),
-                Column::new("attacker_hero_id".into(), sn_attacker_hero_id),
-                Column::new("damage".into(), sn_damage),
-                Column::new("health".into(), sn_health),
-                Column::new("max_health".into(), sn_max_health),
-                Column::new("team_num".into(), sn_team_num),
-                Column::new("x".into(), sn_x),
-                Column::new("y".into(), sn_y),
-                Column::new("z".into(), sn_z),
-            ])
-            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
-            self.cached_datasets[Dataset::SinnersSacrifice] = Some(df);
-        }
-
-        if load_stat_modifier_events {
-            let df = df_from_columns(vec![
-                Column::new("tick".into(), sm_tick),
-                Column::new("hero_id".into(), sm_hero_id),
-                Column::new("stat_type".into(), sm_stat_type),
-                Column::new("amount".into(), sm_amount),
-            ])
-            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
-            self.cached_datasets[Dataset::StatModifierEvents] = Some(df);
-        }
-
-        if load_active_modifiers {
-            let df = df_from_columns(vec![
-                Column::new("tick".into(), am_tick),
-                Column::new("hero_id".into(), am_hero_id),
-                Column::new("event".into(), am_event),
-                Column::new("serial".into(), am_serial),
-                Column::new("modifier_id".into(), am_modifier_id),
-                Column::new("ability_id".into(), am_ability_id),
-                Column::new("duration".into(), am_duration),
-                Column::new("caster_hero_id".into(), am_caster_hero_id),
-                Column::new("stacks".into(), am_stacks),
-            ])
-            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
-            self.cached_datasets[Dataset::ActiveModifiers] = Some(df);
-        }
-
-        if load_ability_ticks {
-            let df = df_from_columns(vec![
-                Column::new("tick".into(), at_tick),
-                Column::new("hero_id".into(), at_hero_id),
-                Column::new("ability_id".into(), at_ability_id),
-                Column::new("slot".into(), at_slot),
-                Column::new("cooldown_start".into(), at_cooldown_start),
-                Column::new("cooldown_end".into(), at_cooldown_end),
-                Column::new("remaining_charges".into(), at_remaining_charges),
-                Column::new("charge_recharge_start".into(), at_charge_recharge_start),
-                Column::new("charge_recharge_end".into(), at_charge_recharge_end),
-            ])
-            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
-            self.cached_datasets[Dataset::AbilityTicks] = Some(df);
-        }
-
-        if load_urn {
-            let df = df_from_columns(vec![
-                Column::new("tick".into(), urn_tick),
-                Column::new("event".into(), urn_event),
-                Column::new("hero_id".into(), urn_hero_id),
-                Column::new("team_num".into(), urn_team_num),
-                Column::new("x".into(), urn_x),
-                Column::new("y".into(), urn_y),
-                Column::new("z".into(), urn_z),
-            ])
-            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
-            self.cached_datasets[Dataset::Urn] = Some(df);
-        }
-
-        if load_street_brawl_ticks {
-            let df = df_from_columns(vec![
-                Column::new("tick".into(), sbt_tick),
-                Column::new("round".into(), sbt_round),
-                Column::new("state".into(), sbt_state),
-                Column::new("amber_score".into(), sbt_amber_score),
-                Column::new("sapphire_score".into(), sbt_sapphire_score),
-                Column::new("buy_countdown".into(), sbt_buy_countdown),
-                Column::new("next_state_time".into(), sbt_next_state_time),
-                Column::new("state_start_time".into(), sbt_state_start_time),
-                Column::new("non_combat_time".into(), sbt_non_combat_time),
-            ])
-            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
-            self.cached_datasets[Dataset::StreetBrawlTicks] = Some(df);
-        }
-
-        if load_street_brawl_rounds {
-            let df = df_from_columns(vec![
-                Column::new("round".into(), sbr_round),
-                Column::new("tick".into(), sbr_tick),
-                Column::new("scoring_team".into(), sbr_scoring_team),
-                Column::new("amber_score".into(), sbr_amber_score),
-                Column::new("sapphire_score".into(), sbr_sapphire_score),
-            ])
-            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
-            self.cached_datasets[Dataset::StreetBrawlRounds] = Some(df);
-        }
-
-        if load_rift {
-            let df = df_from_columns(vec![
-                Column::new("rift_num".into(), rift_num),
-                Column::new("announce_tick".into(), rift_announce_tick),
-                Column::new("active_tick".into(), rift_active_tick),
-                Column::new("capture_tick".into(), rift_capture_tick),
-                Column::new("expire_tick".into(), rift_expire_tick),
-                Column::new("winning_team".into(), rift_winning_team),
-                Column::new("lane".into(), rift_lane),
-                Column::new("x".into(), rift_x),
-                Column::new("y".into(), rift_y),
-                Column::new("z".into(), rift_z),
-            ])
-            .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
-            self.cached_datasets[Dataset::Rift] = Some(df);
-        }
+        if optional_events {if let Some(sink)=spool.as_deref_mut() {
+            let version=replay_catalog_version(game_directory.as_deref());
+            sink.optional_coverage=Some(serde_json::json!({
+                "replayVersion":version,
+                "item_purchases":{"collected":true,"supported":version.is_some(),"source":"AbilitiesChanged","scope":"recorded purchaser only; raw enum; no inventory-diff purchases"},
+                "breakable_events":{"collected":true,"supported":optional_breakables.class_available,"source":"CCitadel_BreakableProp + Damage","scope":"recorded lifecycle and exact damage endpoints; no inferred destruction, loot, intention, or team visibility"},
+                "urn":{"collected":true,"supported":urn_state.is_some(),"source":"replay-version modifier catalog","scope":"effective modifier carrier-state transitions, including causal expiry/catalog removals; not voluntary actions; exact full-handle identity; owner-known carrier state"}
+            }));
+        }}
+        flush_columns!()?;
+        if load_kills {if let Some(sink) = spool.as_deref_mut() { sink.kill_identities(&entity_to_hero)?; }}
 
         Ok(())
     }

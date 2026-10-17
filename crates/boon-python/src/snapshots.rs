@@ -379,7 +379,8 @@ pub(super) const BARRIER_TRACKER_MODIFIER_ID: u32 = 4_267_845_006; // modifier_b
 /// Recorded barrier changes, independent of entity seeking or segment boundaries.
 #[derive(Default)]
 pub(super) struct BarrierTimeline {
-    values: HashMap<u32, Vec<(i32, f32)>>,
+    pub(super) values: HashMap<u32, Vec<(i32, f32)>>,
+    pub(super) disk: Option<std::sync::Mutex<crate::bounded_spool::DiskBarrier>>,
 }
 
 impl BarrierTimeline {
@@ -441,6 +442,10 @@ impl BarrierTimeline {
     }
 
     pub(super) fn remaining(&self, tick: i32, pawn_handle: u32) -> f32 {
+        // The sequential spool cursor keeps historical generations on disk.
+        if let Some(disk)=&self.disk {
+            return disk.lock().expect("barrier disk cursor lock poisoned").remaining(tick,pawn_handle).expect("barrier spool read failed");
+        }
         // Keep the handle's generation: a reused entity index is a new pawn.
         self.values
             .get(&pawn_handle)

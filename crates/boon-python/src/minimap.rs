@@ -3,6 +3,7 @@
 
 use crate::*;
 use boon_parser::{Context, Entity, FieldValue, Serializer};
+use crate::entity_evidence::movement_policy::boundary as movement_sample_boundary;
 
 #[derive(Clone, Copy, Default)]
 struct ControllerKeys {
@@ -125,6 +126,26 @@ fn pawn_for_fow<'a>(
 }
 
 #[derive(Default)]
+struct MinimapSlot {
+    identity: Option<(i64,i64,Option<(i32,u32)>)>,
+    shown: Option<bool>,
+    sample: Option<(i32,i64,i64)>,
+}
+impl MinimapSlot {
+    fn observe(&mut self, identity:(i64,i64,Option<(i32,u32)>), shown:Option<bool>,
+        cell:Option<(i64,i64)>,tick:i32)->(Option<(i32,i64,i64)>,bool) {
+        let identity_changed=self.identity!=Some(identity);
+        if identity_changed {self.sample=None;}
+        let show=shown==Some(true) && self.shown!=Some(true);
+        let refresh=shown==Some(true) && cell.is_some() &&
+            (identity_changed || show || movement_sample_boundary(tick) || self.sample.is_none());
+        if refresh {let (x,y)=cell.unwrap();self.sample=Some((tick,x,y));}
+        if shown==Some(true) && cell.is_none() {self.sample=None;}
+        self.identity=Some(identity);self.shown=shown;
+        (self.sample,refresh)
+    }
+}
+#[derive(Default)]
 struct MinimapCols {
     tick: Vec<i32>,
     observer_team: Vec<i64>,
@@ -142,6 +163,8 @@ struct MinimapCols {
     last_seen_x: Vec<Option<i64>>,
     last_seen_y: Vec<Option<i64>>,
     last_seen: HashMap<(i64, i32, u32), (i32, i64, i64)>,
+    last_seen_disk: Option<rusqlite::Connection>,
+    map_samples: HashMap<(i32,u32,usize),MinimapSlot>,
 }
 
 impl MinimapCols {
@@ -157,6 +180,7 @@ impl MinimapCols {
             return;
         };
         let steam_ids = emit.then(|| controller_steam_ids(ctx, controller_keys));
+        let mut live_slots=HashSet::new();
         for (_, team) in ctx
             .entities()
             .iter()
@@ -208,14 +232,26 @@ impl MinimapCols {
                 } else {
                     None
                 };
+                let slot_key=(team.index,team.serial,i);
+                live_slots.insert(slot_key);
+                let (sample,refresh)=self.map_samples.entry(slot_key).or_default().observe(
+                    (raw_index,target_team,identity.map(|id|(id.index,id.serial))),shown,cell,ctx.tick());
+                let cell=if shown==Some(true) {sample.map(|(_,x,y)|(x,y))} else {None};
                 let id_key = identity.map(|id| (observer_team, id.index, id.serial));
-                if let (Some(key), Some((x, y))) = (id_key, cell) {
-                    self.last_seen.insert(key, (ctx.tick(), x, y));
+                if let (true,Some(key), Some((x, y))) = (refresh,id_key, cell) {
+                    if let Some(disk)=&self.last_seen_disk {
+                        disk.prepare_cached("INSERT OR REPLACE INTO last_seen VALUES (?,?,?,?,?,?)").expect("minimap history statement failed").execute(rusqlite::params![key.0,key.1,key.2,ctx.tick(),x,y]).expect("minimap history write failed");
+                    } else {self.last_seen.insert(key, (ctx.tick(), x, y));}
                 }
                 if !emit {
                     continue;
                 }
-                let remembered = id_key.and_then(|key| self.last_seen.get(&key).copied());
+                let remembered = id_key.and_then(|key| {
+                    if let Some(disk)=&self.last_seen_disk {
+                        use rusqlite::OptionalExtension;
+                        disk.prepare_cached("SELECT tick,x,y FROM last_seen WHERE team=? AND entity=? AND serial=?").expect("minimap history statement failed").query_row(rusqlite::params![key.0,key.1,key.2],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional().expect("minimap history read failed")
+                    } else {self.last_seen.get(&key).copied()}
+                });
                 self.tick.push(ctx.tick());
                 self.observer_team.push(observer_team);
                 self.target_team.push(target_team);
@@ -243,6 +279,9 @@ impl MinimapCols {
                 self.last_seen_y.push(remembered.map(|(_, _, y)| y));
             }
         }
+        // Prune slots on shrink, class/identity invalidation, inactivity or team
+        // generation removal. The last-visible identity history is separate.
+        self.map_samples.retain(|key,_|live_slots.contains(key));
     }
 
     fn into_frame(self) -> PyResult<DataFrame> {
@@ -275,6 +314,8 @@ impl Demo {
     ///
     /// `observer_team` is the shared team information channel. Coordinates are
     /// native 0..255 map bytes and are populated only while the icon is shown.
+    /// Position samples use every tenth source tick plus immediate visibility
+    /// and identity transitions. `last_seen_tick` is the actual sample tick.
     /// Last-seen coordinates come only from a prior shown row with the same
     /// pawn entity identity; unresolved identities keep those fields null.
     /// `target_steam_id` requires one active controller bound to that pawn.
@@ -324,5 +365,66 @@ impl Demo {
                 .map_err(to_py_err)?;
             cols.into_frame().map(PyDataFrame)
         })
+    }
+}
+
+impl Demo {
+    pub(super) fn spool_minimap(&self, sink:&mut crate::bounded_spool::Spool, ticks:&[i32])->PyResult<()> {
+        let selected:HashSet<i32>=ticks.iter().copied().collect();
+        let init=self.parser.parse_init().map_err(to_py_err)?;
+        let hero_key=init.serializers().get("CCitadelPlayerPawn").and_then(|s|s.resolve_field_key("m_CCitadelHeroComponent.m_spawnedHero.m_nHeroID"));
+        let pawn_team_key=init.serializers().get("CCitadelPlayerPawn").and_then(|s|s.resolve_field_key("m_iTeamNum"));
+        let controller_keys=ControllerKeys::resolve(&init);
+        drop(init);
+        let filter=HashSet::from(["CCitadelTeam","CCitadelPlayerPawn","CCitadelPlayerController"]);
+        let disk=rusqlite::Connection::open(sink.root().join("minimap-history.sqlite3")).map_err(|e|InvalidDemoError::new_err(e.to_string()))?;
+        disk.execute_batch("PRAGMA cache_size=-1024; PRAGMA journal_mode=OFF; CREATE TABLE last_seen(team INTEGER,entity INTEGER,serial INTEGER,tick INTEGER,x INTEGER,y INTEGER,PRIMARY KEY(team,entity,serial)) WITHOUT ROWID; BEGIN").map_err(|e|InvalidDemoError::new_err(e.to_string()))?;
+        let mut cols=MinimapCols {last_seen_disk:Some(disk),..Default::default()};
+        let mut error=None;
+        self.parser.try_run_to_end_filtered(&filter,|ctx| {
+            if error.is_some() {return Err(crate::bounded_spool::aborted());}
+            if let Err(e)=sink.check_cancel() {error=Some(e);return Err(crate::bounded_spool::aborted());}
+            cols.collect(ctx,hero_key,pawn_team_key,controller_keys,selected.contains(&ctx.tick()));
+            if cols.tick.len()>=1024 {
+                // Only output columns transfer; the source-observed last-seen
+                // state must survive every batch boundary.
+                let remembered=std::mem::take(&mut cols.last_seen);
+                let disk=cols.last_seen_disk.take();
+                let map_samples=std::mem::take(&mut cols.map_samples);
+                let output=std::mem::replace(&mut cols,MinimapCols {last_seen:remembered,last_seen_disk:disk,map_samples,..Default::default()});
+                error=output.into_frame().and_then(|frame|sink.write("enemy_minimap_ticks",frame)).err();
+            }
+            if error.is_some() {Err(crate::bounded_spool::aborted())} else {Ok(())}
+        }).map_err(|e|error.take().unwrap_or_else(||to_py_err(e)))?;
+        if let Some(error)=error {return Err(error);}
+        sink.write("enemy_minimap_ticks",cols.into_frame()?)
+    }
+}
+
+
+#[cfg(test)]
+mod movement_sample_tests {
+    use super::*;
+    #[test]
+    fn minimap_same_schema_uses_causal_source_sample_ticks() {
+        let mut s=MinimapSlot::default();let id=(148,3,Some((74,2)));
+        assert_eq!(s.observe(id,Some(true),Some((1,2)),3),(Some((3,1,2)),true));
+        assert_eq!(s.observe(id,Some(true),Some((9,9)),9),(Some((3,1,2)),false));
+        assert_eq!(s.observe(id,Some(true),Some((3,4)),10),(Some((10,3,4)),true));
+        assert_eq!(s.observe(id,Some(false),None,11),(Some((10,3,4)),false));
+        assert_eq!(s.observe(id,Some(false),None,20),(Some((10,3,4)),false));
+        assert_eq!(s.observe(id,Some(true),Some((5,6)),21),(Some((21,5,6)),true));
+    }
+    #[test]
+    fn minimap_slot_reuse_and_serial_changes_do_not_reuse_coordinates() {
+        let mut s=MinimapSlot::default();let id=(148,3,Some((74,2)));
+        s.observe(id,Some(true),Some((1,2)),3);
+        let newer=(148,3,Some((74,3)));
+        assert_eq!(s.observe(newer,Some(false),None,4),(None,false));
+        assert_eq!(s.observe(newer,Some(true),Some((5,6)),5),(Some((5,5,6)),true));
+        assert_eq!(s.observe(newer,Some(true),None,6),(None,false));
+        assert_eq!(s.observe(newer,Some(true),Some((7,8)),7),(Some((7,7,8)),true));
+        assert_eq!(s.observe(newer,Some(true),Some((9,10)),10),(Some((10,9,10)),true));
+        assert_eq!(s.observe(newer,Some(true),Some((11,12)),10),(Some((10,11,12)),true));
     }
 }

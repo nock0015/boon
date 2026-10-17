@@ -309,6 +309,9 @@ impl State {
         self.entities.contains_key(&id).then_some(id)
     }
     fn apply(&mut self, row: &V) -> Result<(), String> {
+        if row.get("movementPolicy").is_some() || row.get("movement_samples").is_some() {
+            return Err("Sampled movement evidence requires the qualified backend or reference projector".into());
+        }
         let id = (
             row["entity_index"].as_i64().ok_or("Invalid entity index")?,
             row["entity_serial"]
@@ -1375,6 +1378,9 @@ impl KnownViews {
     #[new]
     fn new(config: &str) -> PyResult<Self> {
         let config: V = serde_json::from_str(config).map_err(error)?;
+        if config.get("movementPolicy").is_some() {
+            return Err(error("Sampled movement evidence requires the qualified backend or reference projector"));
+        }
         let mut state = State::default();
         state.teams = config["teams"]
             .as_object()
@@ -1408,9 +1414,11 @@ impl KnownViews {
                 ));
             }
             for line in data.split(|b| *b == b'\n').filter(|s| !s.is_empty()) {
-                self.state
-                    .pending
-                    .push_back(serde_json::from_slice(line).map_err(error)?);
+                let row: V=serde_json::from_slice(line).map_err(error)?;
+                if row.get("movementPolicy").is_some() || row.get("movement_samples").is_some() {
+                    return Err(error("Sampled movement evidence requires the qualified backend or reference projector"));
+                }
+                self.state.pending.push_back(row);
             }
             self.timings.feed_seconds += start.elapsed().as_secs_f64();
             Ok(())

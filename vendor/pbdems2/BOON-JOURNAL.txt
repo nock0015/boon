@@ -1,0 +1,2 @@
+Vendored pbdems2 0.3.6, crates.io SHA256 623d8f8bb7b89be5af9b7104300e098ed78f0167956490312c479e27972c40bc.
+MIT license retained in LICENSE. Only semantic change: ephemeral per-tick decoded field-key journal in src/entity/entities.rs, cleared with existing tick lifecycle journal. No dependency upgrades.
