@@ -301,7 +301,7 @@ impl RawObservation {
  fn restore(self,node:&mut Node){for(index,value)in [0,1,2,38].into_iter().zip(self.position){node.values[index]=value;}let [source,map,health,world,observed,emitted]=self.times;node.source_time=source;node.map_time=map;node.health_time=health;node.world_time=world;node.position_observation_time=observed;node.position_emitted_time=emitted;node.position_observation_live=self.live;node.extras=self.extras;}
 }
 #[derive(Default)]
-struct Collector {projection_restore:Vec<RawObservation>,projection_cache:projection::ProjectionCache,profile:Profile,zip_homes:zipline_reach::Homes,projection_counts:Vec<(i32,[u64;8])>,rows:rows::EmittedRows,previous:BTreeMap<Scope,Node>,objective_markers:HashSet<Id>,clock_samples:Vec<bool>,clock_terminal:Vec<bool>,clock_ticks:Vec<i32>,clock_seconds:Vec<Option<f64>>,clock_observed_ticks:Vec<Option<i32>>,last_clock:Option<(f64,i32)>,modifiers:boon_parser::ModifierState,modifier_times:HashMap<u32,Option<f64>>,positions:BTreeMap<Scope,PositionAnchor>,last_projection_time:Option<f64>,field_names:FieldNames,camp_positions:BTreeMap<String,([f64;2],Option<f64>)>}
+struct Collector {projection_restore:Vec<RawObservation>,projection_cache:projection::ProjectionCache,profile:Profile,zip_homes:zipline_reach::Homes,projection_counts:Vec<(i32,[u64;8])>,rows:rows::EmittedRows,history:projection::DenseNodes,retired_history:BTreeMap<Scope,Node>,#[cfg(test)]previous:BTreeMap<Scope,Node>,objective_markers:HashSet<Id>,clock_samples:Vec<bool>,clock_terminal:Vec<bool>,clock_ticks:Vec<i32>,clock_seconds:Vec<Option<f64>>,clock_observed_ticks:Vec<Option<i32>>,last_clock:Option<(f64,i32)>,modifiers:boon_parser::ModifierState,modifier_times:HashMap<u32,Option<f64>>,positions:BTreeMap<Scope,PositionAnchor>,last_projection_time:Option<f64>,field_names:FieldNames,camp_positions:BTreeMap<String,([f64;2],Option<f64>)>}
 impl Collector {
  fn count_projection(&mut self,tick:i32,nodes:&projection::DenseNodes){let _method_span=crate::direct_method_profile::span(47);let start=FineInstant::now();let mut counts=[0u64;8];counts[0]=nodes.len()as u64;for node in nodes.values(){let index=match node.audience{0=>1,1=>2,3=>3,2 if node.observer==Some(2)=>4,2 if node.observer==Some(3)=>5,_=>6};counts[index]+=1;if node.audience==0&&node.kind=="player"{counts[7]+=1;}}self.projection_counts.push((tick,counts));self.profile.elapsed("projection.channel_count_receipt",start,nodes.len());}
  #[cfg(test)]
@@ -385,11 +385,14 @@ impl Collector {
  // Runtime path: persistent raw projection and normalized previous records.
  // Unchanged observations refresh their timestamps without cloning a Node.
  fn append_projected(&mut self,tick:i32,time:Option<f64>,mut current:projection::DenseNodes){let _method_span=crate::direct_method_profile::span(49);
+  if let Some(remap)=self.projection_cache.history_remap.take(){self.history.migrate_history(remap,&mut self.retired_history);}
+  assert_eq!(self.history.generation(),current.generation(),"append scope generation");
   let mut restore=std::mem::take(&mut self.projection_restore);restore.clear();restore.extend(current.values().map(RawObservation::save));
   let started=FineInstant::now();self.position_policy_dense(time,&mut current);self.profile.elapsed("append.position_policy",started,current.len());
-  current.for_each_mut(|scope,node|{
+  current.for_each_id_mut(|scope,id,node|{
    let started=FineInstant::now();let explicit_source=node.source_time;let modifier=node.class.as_deref().is_some_and(|c|c.starts_with("modifier:"));
-   let changed=if let Some(old)=self.previous.get(scope).filter(|old|old.id==node.id&&old.owner==node.owner&&old.hero==node.hero&&old.team==node.team){
+   let old=self.history.get_id_mut(id);
+   let changed=if let Some(old)=old.as_deref().filter(|old|old.id==node.id&&old.owner==node.owner&&old.hero==node.hero&&old.team==node.team){
     node.map_time=if node.get("map_age")==Some(0.){time}else{node.map_time.or(old.map_time)};
     node.health_time=if node.get("health_age")==Some(0.){time}else{node.health_time.or(old.health_time)};
     node.world_time=if node.get("world_age")==Some(0.){time}else{node.world_time.or(old.world_time)};
@@ -400,17 +403,18 @@ impl Collector {
    if changed{
     node.source_time=if modifier{explicit_source}else{explicit_source.or(time)};
     let copy=FineInstant::now();self.rows.push((tick,time,node.clone()));self.profile.elapsed("append.output_copy",copy,1);
-    self.previous.insert(scope.clone(),node.clone());
-   }else if let Some(old)=self.previous.get_mut(scope){// Equality intentionally treats signed zeros as equal, but the original
+    if let Some(old)=old{*old=node.clone();}else{self.history.insert_at(id,scope.clone(),node.clone());}
+   }else if let Some(old)=old{// Equality intentionally treats signed zeros as equal, but the original
     // whole-map replacement retained the latest bits for later remembered rows.
     old.values=node.values;old.extras=node.extras.clone();
     old.source_time=node.source_time;old.map_time=node.map_time;old.health_time=node.health_time;old.world_time=node.world_time;old.position_observation_time=node.position_observation_time;old.position_emitted_time=node.position_emitted_time;}
   });
-  let _lifecycle_method=crate::direct_method_profile::span(86);let started=FineInstant::now();let before=self.rows.len();let removed:Vec<_>=self.previous.keys().filter(|scope|!current.contains_key(*scope)).cloned().collect();
-  for scope in removed{let mut node=self.previous.remove(&scope).unwrap();node.active=false;node.values=[None;66];node.extras.clear();node.relations.clear();node.source_time=time;self.rows.push((tick,time,node));}
+  let _lifecycle_method=crate::direct_method_profile::span(86);let started=FineInstant::now();let before=self.rows.len();let removed:Vec<_>=self.history.scope_ids().filter(|&(_,id)|current.get_id(id).is_none()).map(|(scope,_)|scope.clone()).collect();
+  for scope in removed{let node=self.history.remove(&scope).unwrap();self.retired_history.insert(scope,node);}
+  for(_,mut node)in std::mem::take(&mut self.retired_history){node.active=false;node.values=[None;66];node.extras.clear();node.relations.clear();node.source_time=time;self.rows.push((tick,time,node));}
   self.profile.elapsed("append.lifecycle_and_replacement",started,self.rows.len()-before);
-  let mut saved=restore.iter().cloned();current.for_each_mut(|_,node|saved.next().expect("raw restoration count").restore(node));
-  restore.clear();self.projection_restore=restore;self.projection_cache.output=current;
+  {let mut saved=restore.drain(..);current.for_each_mut(|_,node|saved.next().expect("raw restoration count").restore(node));assert!(saved.next().is_none(),"raw restoration count");}
+  self.projection_restore=restore;self.projection_cache.output=current;
  }
  fn frames(self)->PolarsResult<Vec<(&'static str,DataFrame)>>{let _method_span=crate::direct_method_profile::span(50);
   let mut count_cols=vec![Column::new("tick".into(),self.projection_counts.iter().map(|r|r.0).collect::<Vec<_>>())];
@@ -569,6 +573,80 @@ pub(super) fn collect_model_columns<S:ModelSourcePass>(py:Python<'_>,ticks:Vec<i
 #[cfg(test)]
 mod tests {
  use super::*;
+ // Exact-bit checks intentionally differ from Node's IEEE comparison semantics.
+ // Both append implementations must retain identical latest payloads even when
+ // equality compresses signed zero or forces a row for a NaN observation.
+ fn assert_node_bits_match(a:&Node,b:&Node){
+  assert_eq!((&a.key,&a.kind,&a.class,a.id,a.owner,a.team),(&b.key,&b.kind,&b.class,b.id,b.owner,b.team));
+  assert_eq!((a.hero,a.ability,a.audience,a.observer,a.active,a.position_observation_live),(b.hero,b.ability,b.audience,b.observer,b.active,b.position_observation_live));
+  assert_eq!(a.values.map(|v|v.map(f64::to_bits)),b.values.map(|v|v.map(f64::to_bits)));
+  assert_eq!([a.source_time,a.map_time,a.health_time,a.world_time,a.position_observation_time,a.position_emitted_time].map(|v|v.map(f64::to_bits)),[b.source_time,b.map_time,b.health_time,b.world_time,b.position_observation_time,b.position_emitted_time].map(|v|v.map(f64::to_bits)));
+  assert_eq!(a.extras.iter().map(|(k,v)|(k,v.to_bits())).collect::<Vec<_>>(),b.extras.iter().map(|(k,v)|(k,v.to_bits())).collect::<Vec<_>>());
+  assert_eq!(a.relations.as_slice(),b.relations.as_slice());
+ }
+ fn assert_history_oracle_matches(reference:&Collector,persistent:&Collector){
+  assert_eq!(reference.previous.len(),persistent.history.len());
+  for(scope,node)in persistent.history.iter(){assert_node_bits_match(&reference.previous[scope],node);}
+  assert_eq!(reference.rows.len(),persistent.rows.len());
+  for(a,b)in reference.rows.iter().zip(persistent.rows.iter()){
+   assert_eq!(a.0,b.0);assert_eq!(a.1.map(f64::to_bits),b.1.map(f64::to_bits));assert_node_bits_match(&a.2,&b.2);
+  }
+  assert_eq!(reference.positions.keys().collect::<Vec<_>>(),persistent.positions.keys().collect::<Vec<_>>());
+  for(scope,a)in &reference.positions{let b=&persistent.positions[scope];
+   assert_eq!(a.point.map(f64::to_bits),b.point.map(f64::to_bits));assert_eq!(a.life.map(|life|life.map(|v|v.map(f64::to_bits))),b.life.map(|life|life.map(|v|v.map(f64::to_bits))));assert_eq!((a.id,a.gap),(b.id,b.gap));
+   assert_eq!([a.emitted,a.value_observed,a.observed].map(|v|v.map(f64::to_bits)),[b.emitted,b.value_observed,b.observed].map(|v|v.map(f64::to_bits)));
+  }
+  assert!(persistent.retired_history.is_empty());
+ }
+ #[test]
+ fn dense_history_matches_btree_oracle_through_compaction_churn_and_schema_resets(){
+  let mut reference=Collector::default();let mut persistent=Collector::default();let mut generations=HashSet::new();
+  for tick in 0..224{
+   let time=match tick%19{0=>None,1=>Some(f64::from_bits(0x7ff8_0000_0000_0042)),2=>Some(f64::INFINITY),3=>Some(-1.),4=>Some(100.),_=>Some(tick as f64*0.25)};
+   let mut nodes=vec![];
+   // The first insertion order is deliberately the reverse of lexical order.
+   if tick==0{for index in (0..100).rev(){let mut n=Node::new(format!("old:{index}"),"test",2);n.id=Some((index,1));n.observer=Some(2);nodes.push(n);}}
+   for(index,key)in ["zeta","alpha","middle"].into_iter().enumerate(){
+    if (key=="alpha"&&tick%7==1)||(key=="zeta"&&tick%11==4){continue}
+    let mut node=Node::new(key.into(),"test",0);node.id=Some((index as i32,(tick/23)as u32));node.owner=Some(index as u64+(tick/31)as u64);node.hero=Some((tick/29)as i64);node.team=Some(2+(tick/37)as i64%2);
+    node.xyz(Some([if tick%9==1{2.}else if tick%9==2{2.0001}else{tick as f64*0.1},0.,3.]));
+    if tick%17==5{node.set("world_z",None);}
+    node.set("is_alive",Some((tick/13%2)as f64));node.set("last_spawn_source_time",Some((tick/13)as f64));node.set("health_age",Some(0.));node.set("visible",Some(if tick%5==0{0.}else{1.}));
+    if tick%5==0{node.set("world_age",None);}
+    let zero=if tick%2==0{0.}else{-0.};node.values[5]=Some(zero);node.extras.insert("signed-zero".into(),zero);
+    if tick%23==8{node.values[6]=Some(f64::from_bits(0x7ff8_0000_0000_0001));node.extras.insert("nan".into(),f64::from_bits(0x7ff8_0000_0000_0012));}
+    node.map_time=Some(if tick%13==0{f64::NAN}else{-2.});node.health_time=Some(-3.);node.world_time=Some(-4.);node.position_observation_time=Some(-5.);
+    node.relations.push(("zeta".into(),2));node.relations.push(("alpha".into(),1));nodes.push(node);
+   }
+   if tick>1{for index in (0..4).rev(){let mut node=Node::new(format!("churn:{tick}:{index}"),"test",2);node.observer=Some(2);node.id=Some((9,index));nodes.push(node);}}
+   if tick%9==0{let mut node=Node::new("modifier".into(),"upgrade",3);node.class=Some("modifier:1".into());node.source_time=if tick%18==0{None}else{time};nodes.push(node);}
+   let oracle=nodes.iter().map(|node|(node.scope(),node.clone())).collect();
+   let projected=persistent.projection_cache.project_test_nodes(nodes);
+   // Schema replacement must preserve even a not-yet-consumed compaction map.
+   if tick%17==1{persistent.projection_cache.invalidate_schema();}
+   generations.insert(projected.generation());reference.append(tick,time,oracle);persistent.append_projected(tick,time,projected);
+   assert_history_oracle_matches(&reference,&persistent);
+   assert!(persistent.projection_cache.registry_len()<=persistent.history.len()*2+64);
+   assert!(persistent.history.slots_len_for_test()<=persistent.projection_cache.registry_len());
+  }
+  assert!(generations.len()>5,"membership churn must exercise repeated compaction");
+ }
+ #[test]
+ fn dense_history_emits_changed_rows_before_lexical_compaction_tombstones(){
+  let mut c=Collector::default();let mut nodes:Vec<_>=(0..100).rev().map(|i|Node::new(format!("gone:{i}"),"test",0)).collect();nodes.push(Node::new("zz-live".into(),"test",0));
+  let projected=c.projection_cache.project_test_nodes(nodes);c.append_projected(1,Some(0.),projected);let start=c.rows.len();
+  let mut live=Node::new("zz-live".into(),"test",0);live.set("health",Some(1.));let projected=c.projection_cache.project_test_nodes([live]);assert!(c.projection_cache.history_remap.is_some());c.append_projected(2,Some(1.),projected);
+  let rows=&c.rows[start..];assert_eq!(rows.len(),101);assert_eq!(rows[0].2.key,"zz-live");assert!(rows[0].2.active);
+  let actual:Vec<_>=rows[1..].iter().map(|r|r.2.key.clone()).collect();let mut expected:Vec<_>=(0..100).map(|i|format!("gone:{i}")).collect();expected.sort();assert_eq!(actual,expected);assert!(rows[1..].iter().all(|r|!r.2.active));
+  assert_eq!(c.history.slots_len_for_test(),1);assert_eq!(c.projection_cache.registry_len(),1);
+ }
+ #[test]
+ fn restoration_moves_preserve_raw_bits_and_reuse_capacity(){
+  let mut c=Collector::default();let mut node=Node::new("raw".into(),"test",0);node.xyz(Some([-0.,2.,3.]));node.values[38]=Some(-0.);node.extras.insert("signed-zero".into(),-0.);node.extras.insert("nan".into(),f64::from_bits(0x7ff8_0000_0000_0012));
+  node.source_time=Some(-0.);node.map_time=Some(f64::from_bits(0x7ff8_0000_0000_0042));node.health_time=Some(f64::INFINITY);node.world_time=Some(-1.);node.position_observation_time=Some(-2.);node.position_emitted_time=Some(-3.);
+  let projected=c.projection_cache.project_test_nodes([node.clone()]);c.append_projected(0,Some(0.),projected);let capacity=c.projection_restore.capacity();let allocation=c.projection_restore.as_ptr();
+  for tick in 1..32{let projected=c.projection_cache.project_test_nodes([node.clone()]);c.append_projected(tick,Some(tick as f64*0.25),projected);assert_node_bits_match(c.projection_cache.output.values().next().unwrap(),&node);assert!(c.projection_restore.is_empty());assert_eq!(c.projection_restore.capacity(),capacity);assert_eq!(c.projection_restore.as_ptr(),allocation);}
+ }
  #[test]
  fn schema_guard_detects_replacements_but_preserves_initial_bootstrap_and_clones(){
   use boon_parser::entity::{SerializerContainer,ClassInfo,ClassEntry,FlattenedSerializer,FlattenedSerializerDefinition,FlattenedField,DecodeProfile,BareCharEncoding,PreciseQAngleMode};
@@ -599,8 +677,8 @@ mod tests {
     nodes.insert(node.scope(),node);
    }
    let oracle:BTreeMap<_,_>=nodes.iter().map(|(scope,node)|(scope.clone(),node.clone())).collect();
-   reference.append(tick,time,oracle);persistent.append_projected(tick,time,nodes.into());
-   assert!(reference.previous==persistent.previous,"previous differs at tick {tick}");
+   reference.append(tick,time,oracle);let projected=persistent.projection_cache.project_test_nodes(nodes.into_values());persistent.append_projected(tick,time,projected);
+   assert!(reference.previous.len()==persistent.history.len()&&persistent.history.iter().all(|(scope,node)|reference.previous.get(scope)==Some(node)),"previous differs at tick {tick}");
    assert_eq!(reference.rows.len(),persistent.rows.len());
    assert!(reference.rows.iter().zip(persistent.rows.iter()).all(|(a,b)|a.0==b.0&&a.1==b.1&&a.2==b.2),"emitted rows differ at tick {tick}");
    // Raw node coordinates/time evidence survive position anchoring unchanged.
@@ -646,7 +724,7 @@ mod tests {
   let old=Node::new("zero".into(),"test",0);let mut nan=old.clone();nan.map_time=Some(f64::NAN);let mut normalized=old.clone();normalized.map_time=nan.map_time;assert!(!(nan==normalized));assert!(!nan.same_observation_content(&old));
   let mut c=Collector::default();let mut first=old;first.values[5]=Some(0.);first.extras.insert("zero".into(),0.);c.append_projected(1,Some(0.),[(first.scope(),first.clone())].into_iter().collect());
   first.values[5]=Some(-0.);first.extras.insert("zero".into(),-0.);c.append_projected(2,Some(1.),[(first.scope(),first)].into_iter().collect());
-  assert_eq!(c.rows.len(),1);let saved=c.previous.values().next().unwrap();assert_eq!(saved.values[5].unwrap().to_bits(),(-0_f64).to_bits());assert_eq!(saved.extras["zero"].to_bits(),(-0_f64).to_bits());
+  assert_eq!(c.rows.len(),1);let saved=c.history.values().next().unwrap();assert_eq!(saved.values[5].unwrap().to_bits(),(-0_f64).to_bits());assert_eq!(saved.extras["zero"].to_bits(),(-0_f64).to_bits());
  }
  #[test]
  fn borrowed_comparison_preserves_changed_then_sorted_tombstone_order(){

@@ -24,9 +24,12 @@ struct ModifierEffect{deadline:Option<f32>,aura:bool,effective:bool,version:u64}
 impl ModifierEffect{fn effective_at(&self,now:Option<f32>)->bool{self.aura&&match(now,self.deadline){(Some(now),Some(at))=>now<at,_=>true}}}
 // Scope IDs are invocation-local, stable handles. Ordering remains the exact
 // lexicographic Scope order in `output`; IDs never determine emitted row order.
-type ScopeId=usize;
+pub(super) type ScopeId=usize;
+// A compaction is the only operation that changes a live scope handle.
+// History consumes this exact mapping before using the next projection IDs.
+pub(super) struct ScopeRemap{from_generation:u64,to_generation:u64,old_to_new:Vec<Option<ScopeId>>}
 #[derive(Default)]
-struct ScopeRegistry{ids:HashMap<Scope,ScopeId>,scopes:Vec<Scope>,seen:Vec<bool>}
+struct ScopeRegistry{ids:HashMap<Scope,ScopeId>,scopes:Vec<Scope>,seen:Vec<bool>,generation:u64}
 impl ScopeRegistry{
  fn intern(&mut self,scope:Scope)->ScopeId{if let Some(&id)=self.ids.get(&scope){return id}let id=self.scopes.len();self.ids.insert(scope.clone(),id);self.scopes.push(scope);self.seen.push(false);id}
  fn begin(&mut self){self.seen.fill(false);}
@@ -35,10 +38,14 @@ impl ScopeRegistry{
 // Payload access by cached ScopeId never hashes or compares replay strings.
 // The ordered index changes only on membership changes; IDs are never order.
 #[derive(Default)]
-pub(super) struct DenseNodes {slots:Vec<Option<Node>>,order:BTreeMap<Scope,ScopeId>}
+pub(super) struct DenseNodes {slots:Vec<Option<Node>>,order:BTreeMap<Scope,ScopeId>,generation:u64}
 impl DenseNodes {
  pub(super) fn len(&self)->usize{self.order.len()}
  pub(super) fn keys(&self)->impl Iterator<Item=&Scope>{self.order.keys()}
+ pub(super) fn iter(&self)->impl Iterator<Item=(&Scope,&Node)>{self.order.iter().map(|(scope,&id)|(scope,self.slots[id].as_ref().expect("live dense scope")))}
+ pub(super) fn scope_ids(&self)->impl Iterator<Item=(&Scope,ScopeId)>{self.order.iter().map(|(scope,&id)|(scope,id))}
+ pub(super) fn generation(&self)->u64{self.generation}
+ #[cfg(test)]pub(super) fn slots_len_for_test(&self)->usize{self.slots.len()}
  pub(super) fn values(&self)->impl Iterator<Item=&Node>{self.order.values().map(|&id|self.slots[id].as_ref().expect("live dense scope"))}
  pub(super) fn get(&self,scope:&Scope)->Option<&Node>{self.order.get(scope).and_then(|&id|self.get_id(id))}
  pub(super) fn get_mut(&mut self,scope:&Scope)->Option<&mut Node>{let id=*self.order.get(scope)?;self.get_id_mut(id)}
@@ -46,16 +53,26 @@ impl DenseNodes {
  pub(super) fn get_id_mut(&mut self,id:ScopeId)->Option<&mut Node>{self.slots.get_mut(id).and_then(Option::as_mut)}
  pub(super) fn contains_key(&self,scope:&Scope)->bool{self.order.contains_key(scope)}
  pub(super) fn insert_at(&mut self,id:ScopeId,scope:Scope,node:Node){if self.slots.len()<=id{self.slots.resize_with(id+1,||None);}self.slots[id]=Some(node);self.order.insert(scope,id);}
- pub(super) fn for_each_mut(&mut self,mut f:impl FnMut(&Scope,&mut Node)){let slots=&mut self.slots;for(scope,&id)in &self.order{f(scope,slots[id].as_mut().expect("live dense scope"));}}
+ pub(super) fn for_each_mut(&mut self,mut f:impl FnMut(&Scope,&mut Node)){self.for_each_id_mut(|scope,_,node|f(scope,node));}
+ pub(super) fn for_each_id_mut(&mut self,mut f:impl FnMut(&Scope,ScopeId,&mut Node)){let slots=&mut self.slots;for(scope,&id)in &self.order{f(scope,id,slots[id].as_mut().expect("live dense scope"));}}
+ pub(super) fn remove(&mut self,scope:&Scope)->Option<Node>{let id=self.order.remove(scope)?;self.slots[id].take()}
+ pub(super) fn migrate_history(&mut self,remap:ScopeRemap,retired:&mut BTreeMap<Scope,Node>){
+  assert_eq!(self.generation,remap.from_generation,"history scope generation");
+  let mut old=std::mem::take(self);self.generation=remap.to_generation;
+  self.slots.resize_with(remap.old_to_new.iter().flatten().copied().max().map_or(0,|id|id+1),||None);
+  for(scope,id)in old.order{let node=old.slots[id].take().expect("live history scope");
+   if let Some(next)=remap.old_to_new[id]{self.insert_at(next,scope,node);}else{retired.insert(scope,node);}
+  }
+ }
  pub(super) fn retain(&mut self,mut keep:impl FnMut(ScopeId)->bool){let slots=&mut self.slots;self.order.retain(|_,id|if keep(*id){true}else{slots[*id]=None;false});}
- pub(super) fn remap(&mut self,registry:&ScopeRegistry){let mut old=std::mem::take(self);self.slots.resize_with(registry.scopes.len(),||None);for(scope,id)in old.order{let next=registry.ids[&scope];self.slots[next]=old.slots[id].take();self.order.insert(scope,next);}}
+ pub(super) fn remap(&mut self,registry:&ScopeRegistry){let mut old=std::mem::take(self);self.generation=registry.generation;self.slots.resize_with(registry.scopes.len(),||None);for(scope,id)in old.order{let next=registry.ids[&scope];self.slots[next]=old.slots[id].take();self.order.insert(scope,next);}}
 }
 impl std::ops::Index<&Scope> for DenseNodes{type Output=Node;fn index(&self,scope:&Scope)->&Node{self.get(scope).expect("missing dense scope")}}
 #[cfg(test)]impl From<BTreeMap<Scope,Node>> for DenseNodes{fn from(nodes:BTreeMap<Scope,Node>)->Self{let mut out=Self::default();for(scope,node)in nodes{out.insert_at(out.slots.len(),scope,node);}out}}
 #[cfg(test)]impl FromIterator<(Scope,Node)> for DenseNodes{fn from_iter<T:IntoIterator<Item=(Scope,Node)>>(nodes:T)->Self{BTreeMap::from_iter(nodes).into()}}
 struct ProjectedMap{output:DenseNodes,registry:ScopeRegistry,current_len:usize}
 impl ProjectedMap{
- fn new(output:DenseNodes,mut registry:ScopeRegistry)->Self{registry.begin();Self{output,registry,current_len:0}}
+ fn new(output:DenseNodes,mut registry:ScopeRegistry)->Self{assert_eq!(output.generation,registry.generation,"projection scope generation");registry.begin();Self{output,registry,current_len:0}}
  fn mark(&mut self,id:ScopeId){if !self.registry.seen[id]{self.registry.seen[id]=true;self.current_len+=1;}}
  fn has_all(&self,ids:&[ScopeId])->bool{ids.iter().all(|&id|self.output.get_id(id).is_some())}
  fn keep(&mut self,ids:&[ScopeId]){for &id in ids{debug_assert!(self.output.get_id(id).is_some());self.mark(id);}}
@@ -70,7 +87,7 @@ impl ProjectedMap{
 }
 #[derive(Default)]
 pub(super) struct ProjectionCache{
- pub(super) output:DenseNodes,scope_registry:ScopeRegistry,
+ pub(super) output:DenseNodes,scope_registry:ScopeRegistry,pub(super) history_remap:Option<ScopeRemap>,
  seeded:bool,dirty:HashSet<i32>,dirty_groups:HashMap<i32,u8>,field_groups:HashMap<(i32,u64),u8>,candidates:[std::collections::BTreeSet<i32>;7],
  rows:HashMap<(u8,Id),(Binding,Option<u32>,Vec<ScopeId>)>,objective_rows:HashMap<Id,(ScopeId,[Option<f64>;66])>,
  upgrades:HashMap<Id,(Binding,Vec<(usize,i64,Option<u32>)>,Option<Vec<(usize,i64)>>)>,
@@ -83,20 +100,26 @@ impl ProjectionCache{
  pub(super) fn invalidate_schema(&mut self){
   // Keep qualified historical observations and scope handles, but discard every
   // derived key/value/topology plan. Original home identities live in Collector.
-  let output=std::mem::take(&mut self.output);let scope_registry=std::mem::take(&mut self.scope_registry);let remembered_scopes=std::mem::take(&mut self.remembered_scopes);
-  *self=Self{output,scope_registry,remembered_scopes,..Self::default()};
+  let output=std::mem::take(&mut self.output);let scope_registry=std::mem::take(&mut self.scope_registry);let remembered_scopes=std::mem::take(&mut self.remembered_scopes);let history_remap=self.history_remap.take();
+  *self=Self{output,scope_registry,remembered_scopes,history_remap,..Self::default()};
  }
 
  fn finish(&mut self,out:ProjectedMap)->DenseNodes{
   let (mut output,mut registry)=out.finish();
   if registry.ids.len()>output.len().saturating_mul(2).saturating_add(64){
-   let mut compact=ScopeRegistry::default();for scope in output.keys(){compact.intern(scope.clone());}
+   let mut compact=ScopeRegistry{generation:registry.generation.checked_add(1).expect("scope generation overflow"),..ScopeRegistry::default()};for scope in output.keys(){compact.intern(scope.clone());}
+   assert!(self.history_remap.is_none(),"unconsumed history scope remap");
+   self.history_remap=Some(ScopeRemap{from_generation:registry.generation,to_generation:compact.generation,old_to_new:registry.scopes.iter().map(|scope|compact.ids.get(scope).copied()).collect()});
    self.remembered_scopes=self.remembered_scopes.iter().filter_map(|&id|compact.ids.get(&registry.scopes[id]).copied()).collect();
    self.rows.clear();self.modifier_rows.clear();self.rule_scopes.clear();self.objective_rows.clear();self.zip_scopes.clear();self.zip_revision=None;
    output.remap(&compact);registry=compact;
   }
   self.scope_registry=registry;output
  }
+ #[cfg(test)]pub(super) fn project_test_nodes(&mut self,nodes:impl IntoIterator<Item=Node>)->DenseNodes{
+  let mut out=ProjectedMap::new(std::mem::take(&mut self.output),std::mem::take(&mut self.scope_registry));for node in nodes{out.insert(node);}self.finish(out)
+ }
+ #[cfg(test)]pub(super) fn registry_len(&self)->usize{self.scope_registry.scopes.len()}
  pub(super) fn modifier_changed(&mut self,serial:u32){self.modifier_rows.remove(&serial);self.effects.remove(&serial);}
  fn modifier_clock(&mut self,now:Option<f32>){
   if self.expiry.len()>self.effects.len().saturating_mul(2).saturating_add(64){self.expiry.retain(|expiry|self.effects.get(&expiry.serial).is_some_and(|effect|effect.version==expiry.version));}
@@ -322,13 +345,13 @@ impl Collector{
    if let Some(rows)=markers.get(&(e.index,e.serial)){let p=rows[0].protected;if rows.iter().all(|s|s.protected==p){node.set("protected",p.map(|v|v as u8 as f64));}let hp=rows[0].health;if rows.iter().all(|s|s.health==hp){node.set("health_byte",hp);}}
   }
   // Public objectives remain remembered even if no active server entity exists.
-  for(scope,old)in &self.previous{if old.class.as_deref().is_some_and(objective)&&old.audience==0&&!out.contains_key(scope){
+  for(scope,old)in self.history.iter(){if old.class.as_deref().is_some_and(objective)&&old.audience==0&&!out.contains_key(scope){
    let id=out.registry.intern(scope.clone());
    if let Some(saved)=out.output.get_id_mut(id){saved.values=old.values;RawObservation::save(old).restore(saved);saved.set("health_age",None);saved.set("world_age",None);out.mark(id);}
    else{let mut saved=old.clone();saved.set("health_age",None);saved.set("world_age",None);put(&mut out,saved);}
   }}
   out.for_each_mut(|node|{if !(node.audience==0&&node.class.as_deref().is_some_and(objective)){return}
-   let Some(id)=node.id else{return};let was_missing=self.previous.get(&node.scope()).is_some_and(|old|old.extras.get("life-evidence:missing-objective-marker")==Some(&1.));
+   let Some(id)=node.id else{return};let was_missing=self.history.get(&node.scope()).is_some_and(|old|old.extras.get("life-evidence:missing-objective-marker")==Some(&1.));
    let mut statuses=vec![];
    if self.objective_markers.contains(&id)&&chans.len()==2&&chans.iter().all(|c|c.complete){
     for ch in &chans{let found:Vec<_>=ch.slots.iter().filter(|s|s.raw/ch.divisor==id.0 as i64).collect();if found.is_empty(){statuses.push(Some(false));continue}let exact=model_entities.get(ctx.entities(),id.0).is_some_and(|e|e.active&&e.serial==id.1);let proper=classes.get(&found[0].class).is_some_and(|c|c==objective_code(node.class.as_deref().unwrap()));statuses.push((exact&&proper).then_some(found[0].visible));}
