@@ -10,6 +10,19 @@ where
     Series::from_vec(name.into(), values).into_column()
 }
 
+// Experiment-only source validity. Defaults in lenient getters are never evidence.
+pub(super) fn source_int(e: &boon_parser::Entity, k: Option<u64>) -> Option<i64> {
+    use boon_parser::FieldValue::*;
+    match e.field_value(k)? { I32(v) => Some(i64::from(*v)), U32(v) => Some(i64::from(*v)),
+        I64(v) => Some(*v), U64(v) => i64::try_from(*v).ok(), _ => None }
+}
+pub(super) fn source_float(e: &boon_parser::Entity, k: Option<u64>) -> Option<f32> {
+    match e.field_value(k)? { boon_parser::FieldValue::F32(v) if v.is_finite() => Some(*v), _ => None }
+}
+pub(super) fn source_bool(e: &boon_parser::Entity, k: Option<u64>) -> Option<bool> {
+    match e.field_value(k)? { boon_parser::FieldValue::Bool(v) => Some(*v), _ => None }
+}
+
 // ─────────────────────────── Parallel player_ticks ───────────────────────────
 //
 // `player_ticks` is a per-tick full snapshot of player pawn + controller state.
@@ -462,6 +475,7 @@ impl BarrierTimeline {
 /// serial builder in `load()`.
 #[derive(Default)]
 pub(super) struct PtCols {
+    pub(super) source_available: Vec<u64>,
     pub(super) steam_id: Vec<Option<u64>>,
     pub(super) ammo_fraction: Vec<Option<f32>>,
     pub(super) tick: Vec<i32>,
@@ -544,6 +558,39 @@ impl PtCols {
             if hid == 0 {
                 continue;
             }
+            self.source_available.push([
+                source_int(pawn,k.cell_x).is_some() && source_float(pawn,k.vec_x).is_some(), // bit 0: x
+                source_int(pawn,k.cell_y).is_some() && source_float(pawn,k.vec_y).is_some(), // bit 1: y
+                source_int(pawn,k.cell_z).is_some() && source_float(pawn,k.vec_z).is_some(), // bit 2: z
+                source_float(pawn,k.death_time).is_some(), // bit 3: death_time
+                source_float(pawn,k.last_spawn).is_some(), // bit 4: last_spawn_time
+                source_float(pawn,k.respawn).is_some(), // bit 5: respawn_time
+                source_int(pawn,k.health).is_some(), // bit 6: health
+                if ctrl.get_i64(k.health_max)>0 {source_int(ctrl,k.health_max).is_some()} else {source_int(pawn,k.max_health).is_some()}, // bit 7: max_health
+                source_int(pawn,k.souls).is_some(), // bit 8: souls
+                source_int(pawn,k.spent_souls).is_some(), // bit 9: spent_souls
+                source_float(ctrl,k.health_regen).is_some(), // bit 10: health_regen
+                source_float(ctrl,k.ult_cd_end).is_some(), // bit 11: ultimate_cooldown_start
+                source_float(ctrl,k.ult_cd_start).is_some(), // bit 12: ultimate_cooldown_end
+                source_int(pawn,k.lifestate).is_some(), // bit 13: lifestate
+                source_bool(ctrl,k.alive).is_some(), // bit 14: is_alive
+                source_bool(ctrl,k.rebirth).is_some(), // bit 15: has_rebirth
+                source_bool(ctrl,k.rejuvenator).is_some(), // bit 16: has_rejuvenator
+                source_bool(ctrl,k.ultimate).is_some(), // bit 17: has_ultimate_trained
+                source_int(ctrl,k.ap_nw).is_some(), // bit 18: ap_net_worth
+                source_int(ctrl,k.gold_nw).is_some(), // bit 19: gold_net_worth
+                source_int(ctrl,k.denies).is_some(), // bit 20: denies
+                source_int(ctrl,k.hero_damage).is_some(), // bit 21: hero_damage
+                source_int(ctrl,k.hero_healing).is_some(), // bit 22: hero_healing
+                source_int(ctrl,k.obj_damage).is_some(), // bit 23: objective_damage
+                source_int(ctrl,k.self_healing).is_some(), // bit 24: self_healing
+                source_int(ctrl,k.kill_streak).is_some(), // bit 25: kill_streak
+                source_int(ctrl,k.last_hits).is_some(), // bit 26: last_hits
+                source_int(ctrl,k.level).is_some(), // bit 27: level
+                source_int(ctrl,k.kills).is_some(), // bit 28: kills
+                source_int(ctrl,k.deaths).is_some(), // bit 29: deaths
+                source_int(ctrl,k.assists).is_some(), // bit 30: assists
+            ].iter().enumerate().fold(0u64, |bits,(i,valid)| bits | (u64::from(*valid)<<i)));
             self.steam_id.push(match ctrl.field_value(k.steam_id) {
                 Some(boon_parser::FieldValue::U64(id)) if *id != 0 => Some(*id),
                 _ => None,
@@ -649,6 +696,7 @@ impl PtCols {
         }
         df_from_columns(vec![
             numeric_column("tick", self.tick),
+            numeric_column("source_available", self.source_available),
             Column::new("steam_id".into(), self.steam_id),
             Column::new("ammo_fraction".into(), self.ammo_fraction),
             numeric_column("hero_id", self.hero_id),
@@ -728,6 +776,7 @@ impl WkKeys {
 /// `world_ticks` column vectors (one row per tick).
 #[derive(Default)]
 pub(super) struct WtCols {
+    pub(super) source_available: Vec<u64>,
     pub(super) tick: Vec<i32>,
     pub(super) is_paused: Vec<bool>,
     pub(super) next_midboss: Vec<f32>,
@@ -741,6 +790,7 @@ impl WtCols {
             .find(|(_, e)| e.class_name.as_ref() == "CCitadelGameRulesProxy")
         {
             self.tick.push(ctx.tick());
+            self.source_available.push(u64::from(source_bool(e,k.is_paused).is_some()) | (u64::from(source_float(e,k.next_midboss).is_some()) << 1));
             self.is_paused.push(e.get_bool(k.is_paused));
             self.next_midboss.push(e.get_f32(k.next_midboss));
         }
@@ -749,6 +799,7 @@ impl WtCols {
     pub(super) fn into_dataframe(self) -> PyResult<DataFrame> {
         df_from_columns(vec![
             numeric_column("tick", self.tick),
+            numeric_column("source_available", self.source_available),
             Column::new("is_paused".into(), self.is_paused),
             numeric_column("next_midboss", self.next_midboss),
         ])
@@ -967,5 +1018,22 @@ impl TickPredicate {
                 t >= *start && t <= *end && ticks.contains(&t)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod direct_source_validity_tests {
+    use super::*;
+    use boon_parser::{Entity, FieldValue};
+    #[test]
+    fn known_zero_and_false_are_not_missing() {
+        let fields=[(1,FieldValue::I32(0)),(2,FieldValue::F32(0.)),(3,FieldValue::Bool(false)),(4,FieldValue::F32(f32::NAN))].into_iter().collect();
+        let e=Entity::from_fields(1,1,0,"CCitadelPlayerPawn",true,fields).unwrap();
+        assert_eq!(source_int(&e,Some(1)),Some(0));
+        assert_eq!(source_float(&e,Some(2)),Some(0.));
+        assert_eq!(source_bool(&e,Some(3)),Some(false));
+        assert_eq!(source_int(&e,None),None);assert_eq!(source_int(&e,Some(99)),None);
+        assert_eq!(source_int(&e,Some(3)),None);assert_eq!(source_float(&e,Some(1)),None);
+        assert_eq!(source_bool(&e,Some(1)),None);assert_eq!(source_float(&e,Some(4)),None);
     }
 }

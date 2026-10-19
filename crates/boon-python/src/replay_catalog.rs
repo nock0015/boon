@@ -170,13 +170,18 @@ fn load(root: &Path, version: &str) -> Result<Option<StatCatalog>, String> {
     Ok(Some(catalog))
 }
 
+// Experiment-only equivalence explicitly approved for retained replay 6745.
+// Exact hashes/provenance of the 6742 bundle remain mandatory. No other replay
+// version or truthy-looking flag selects an alternate catalog.
+fn experimental_bundle_version(version: &str, approval: Option<&str>) -> Option<&'static str> {
+    if version == VERSION || (version == "6745" && approval == Some("1")) {Some(VERSION)} else {None}
+}
 pub(crate) fn from_environment(version: &str) -> Result<Option<StatCatalog>, String> {
-    if version != VERSION {
-        return Ok(None);
-    }
+    let approval=std::env::var("BOON_EXPERIMENT_APPROVE_CATALOG_6742_FOR_6745").ok();
+    let Some(bundle_version)=experimental_bundle_version(version,approval.as_deref()) else {return Ok(None);};
     // Preserve the previously exported environment alias for existing callers.
     match std::env::var_os("BOON_REPLAY_CATALOG_ROOT").or_else(||std::env::var_os("BOON_LAB_CATALOG_ROOT")) {
-        Some(root) => load(&PathBuf::from(root), version),
+        Some(root) => load(&PathBuf::from(root), bundle_version),
         None => Ok(None),
     }
 }
@@ -216,6 +221,17 @@ mod tests {
         name: "fixture.json", bytes: 3,
         sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
     };
+
+    #[test]
+    fn experiment_catalog_alias_requires_exact_pair_and_explicit_flag() {
+        assert_eq!(experimental_bundle_version("6742",None),Some("6742"));
+        assert_eq!(experimental_bundle_version("6745",None),None);
+        assert_eq!(experimental_bundle_version("6745",Some("")),None);
+        assert_eq!(experimental_bundle_version("6745",Some("true")),None);
+        assert_eq!(experimental_bundle_version("6745",Some("1 ")),None);
+        assert_eq!(experimental_bundle_version("6745",Some("1")),Some("6742"));
+        assert_eq!(experimental_bundle_version("6746",Some("1")),None);
+    }
 
     #[test]
     fn other_versions_cannot_be_aliased_to_the_bundle() {

@@ -40,8 +40,9 @@ pub mod ge {
 
 /// Return a human-readable name for a user message type.
 pub fn user_message_name(msg_type: i32) -> String {
-    boon_proto::proto::CitadelUserMessageIds::try_from(msg_type)
+    boon_proto::proto::CitadelEntityMessageIds::try_from(msg_type)
         .map(|e| e.as_str_name().to_string())
+        .or_else(|_| boon_proto::proto::CitadelUserMessageIds::try_from(msg_type).map(|e| e.as_str_name().to_string()))
         .unwrap_or_else(|_| format!("UserMessage_{}", msg_type))
 }
 

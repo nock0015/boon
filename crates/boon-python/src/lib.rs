@@ -41,6 +41,10 @@ mod datasets;
 mod entity_evidence;
 mod restore_index;
 mod restore_ziplines;
+mod direct_ziplines;
+mod direct_method_profile;
+mod direct_model_columns;
+mod direct_breakable_messages;
 mod restore_views;
 mod getters;
 mod hero_stats;
@@ -107,6 +111,7 @@ struct Demo {
 #[pymodule]
 fn _boon(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("ENTITY_EVIDENCE_WIRE_VERSION",1u32)?;
+    m.add("DIRECT_PROFILING_ENABLED",direct_method_profile::AVAILABLE)?;
     m.add_function(wrap_pyfunction!(replay_catalog::_verify_replay_catalog, m)?)?;
     m.add_class::<Demo>()?;
     m.add_class::<bounded_spool::NativeSpoolReader>()?;

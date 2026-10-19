@@ -17,7 +17,7 @@ mod playback;
 
 use boon_proto::proto::{
     CDemoFileHeader, CDemoFileInfo, CDemoFullPacket, CDemoPacket, CMsgSource1LegacyGameEvent,
-    CMsgSource1LegacyGameEventList, CitadelUserMessageIds, CsvcMsgUserMessage, EBaseUserMessages,
+    CMsgSource1LegacyGameEventList, CitadelUserMessageIds, CitadelEntityMessageIds, CsvcMsgUserMessage, EBaseUserMessages,
     ECitadelGameEvents,
 };
 
@@ -34,7 +34,8 @@ const PACKET_BUF_CAPACITY: usize = 64 * 1024;
 
 fn is_direct_event_type(message_type: u32) -> bool {
     let message_type = message_type as i32;
-    CitadelUserMessageIds::try_from(message_type).is_ok()
+    CitadelEntityMessageIds::try_from(message_type).is_ok()
+        || CitadelUserMessageIds::try_from(message_type).is_ok()
         || ECitadelGameEvents::try_from(message_type).is_ok()
         || EBaseUserMessages::try_from(message_type).is_ok()
 }
@@ -527,7 +528,9 @@ impl Parser {
                     // Citadel user messages (300-366) are sent directly in
                     // the packet stream, not wrapped in CSVCMsg_UserMessage.
                     let t = msg_type as i32;
-                    let name = if let Ok(e) = CitadelUserMessageIds::try_from(t) {
+                    let name = if let Ok(e) = CitadelEntityMessageIds::try_from(t) {
+                        Some(e.as_str_name().to_string())
+                    } else if let Ok(e) = CitadelUserMessageIds::try_from(t) {
                         Some(e.as_str_name().to_string())
                     } else if let Ok(e) = ECitadelGameEvents::try_from(t) {
                         Some(e.as_str_name().to_string())

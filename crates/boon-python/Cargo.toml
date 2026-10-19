@@ -12,6 +12,11 @@ publish = false
 name = "_boon"
 crate-type = ["cdylib"]
 
+[features]
+default = []
+# Expensive per-helper recording and fine-grained clocks are opt-in artifacts.
+direct-method-profile = []
+
 [dependencies]
 serde.workspace = true
 serde_json = { workspace = true, features = ["float_roundtrip", "preserve_order"] }

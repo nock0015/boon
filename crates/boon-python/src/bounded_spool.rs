@@ -41,13 +41,15 @@ pub(super) struct Spool {
     written_bytes:u64,
     nonfinite_lifecycle:bool,
     decode_cohorts:Vec<Vec<String>>,
+    shared_model_columns:bool,
+    pub(super) event_profile:Vec<serde_json::Value>,
     pub(super) optional_events:bool,
     pub(super) optional_coverage:Option<serde_json::Value>,
 }
 impl Spool {
     pub(super) fn new(root: &Path,progress:Option<Py<PyAny>>) -> PyResult<Self> {
         std::fs::create_dir(root)?;
-        Ok(Self { root: root.to_owned(), manifest: HashWriter::new(BufWriter::new(OpenOptions::new().write(true).create_new(true).open(root.join("batches.jsonl"))?)),auxiliary_hashes:HashMap::new(), counts: HashMap::new(), ordinal: 0, last_signal_check:std::time::Instant::now(),peak_batch_bytes:0,peak_batch_rows:0,peak_collector_rows:0,peak_collector_bytes:0,owner_status:None,progress,written_bytes:0,nonfinite_lifecycle:false,decode_cohorts:Vec::new(),optional_events:false,optional_coverage:None })
+        Ok(Self { root: root.to_owned(), manifest: HashWriter::new(BufWriter::new(OpenOptions::new().write(true).create_new(true).open(root.join("batches.jsonl"))?)),auxiliary_hashes:HashMap::new(), counts: HashMap::new(), ordinal: 0, last_signal_check:std::time::Instant::now(),peak_batch_bytes:0,peak_batch_rows:0,peak_collector_rows:0,peak_collector_bytes:0,owner_status:None,progress,written_bytes:0,nonfinite_lifecycle:false,decode_cohorts:Vec::new(),shared_model_columns:false,optional_events:false,optional_coverage:None,event_profile:Vec::new() })
     }
     pub(super) fn root(&self)->&Path {&self.root}
     pub(super) fn check_cancel(&mut self)->PyResult<()> {
@@ -120,7 +122,10 @@ impl Spool {
     pub(super) fn kill_identities(&mut self,identities:&HashMap<i32,i64>)->PyResult<()> {self.write_auxiliary("kill-identities.json",identities)}
     fn finish(mut self) -> PyResult<String> {
         self.manifest.flush()?;
-        let mut receipt=serde_json::json!({"schema":"boon-bounded-spool-v1","rows":self.counts,"batches":self.ordinal,"batchRows":1024,"batchBytes":4*1024*1024,"sourceTickAllowance":true,"kills":"final-entity-hero-map","input":"read-only-mmap","preparedIndex":"disabled-cold-sequential-sessions","peakNativeBatchBytes":self.peak_batch_bytes,"peakNativeBatchRows":self.peak_batch_rows,"peakTableCollectorRows":self.peak_collector_rows,"peakTableCollectorBytes":self.peak_collector_bytes,"ownerStatus":self.owner_status,"nonfiniteLifecycle":self.nonfinite_lifecycle,"decodeCohorts":self.decode_cohorts,"integrity":"sha256-batches-manifest-aux-v1","manifestSha256":format!("{:x}",self.manifest.digest.clone().finalize()),"auxiliarySha256":self.auxiliary_hashes});
+        let mut receipt=serde_json::json!({"schema":"boon-bounded-spool-v1","eventProfile":self.event_profile,"rows":self.counts,"batches":self.ordinal,"batchRows":1024,"batchBytes":4*1024*1024,"sourceTickAllowance":true,"kills":"final-entity-hero-map","input":"read-only-mmap","preparedIndex":"disabled-cold-sequential-sessions","peakNativeBatchBytes":self.peak_batch_bytes,"peakNativeBatchRows":self.peak_batch_rows,"peakTableCollectorRows":self.peak_collector_rows,"peakTableCollectorBytes":self.peak_collector_bytes,"ownerStatus":self.owner_status,"nonfiniteLifecycle":self.nonfinite_lifecycle,"decodeCohorts":self.decode_cohorts,"integrity":"sha256-batches-manifest-aux-v1","manifestSha256":format!("{:x}",self.manifest.digest.clone().finalize()),"auxiliarySha256":self.auxiliary_hashes});
+        if self.shared_model_columns {
+            receipt["sharedSourcePass"]=serde_json::json!({"modelColumns":true,"recordedEvents":true,"decodePasses":1,"passScope":"completed source ticks; header and schema initialization excluded","collectors":"retained loader collectors","dispatch":"model observer, retained entity/event collectors, bounded flush"});
+        }
         if self.optional_events {
             receipt["optionalEventsContract"]=serde_json::json!(crate::optional_events::CONTRACT);
             receipt["optionalEventCoverage"]=self.optional_coverage.ok_or_else(||InvalidDemoError::new_err("Missing optional event collection coverage"))?;
@@ -129,6 +134,25 @@ impl Spool {
         let mut file=OpenOptions::new().write(true).create_new(true).open(self.root.join("complete.json"))?;
         file.write_all(encoded.as_bytes())?;
         Ok(encoded)
+    }
+}
+
+fn combined_event_datasets(names:&[String])->PyResult<Vec<Dataset>> {
+    let allowed=["damage","abilities","resource_events","soul_bag_pickups"];
+    if !names.iter().any(|name|matches!(name.as_str(),"damage"|"resource_events"|"soul_bag_pickups"))||names.iter().any(|name|!allowed.contains(&name.as_str())) {
+        return Err(pyo3::exceptions::PyValueError::new_err("combined model pass requires damage or resource events, with optional abilities; other cohorts are unsupported"));
+    }
+    names.iter().map(|name|name.parse()).collect()
+}
+
+struct SharedModelSource<'a> {demo:&'a mut Demo,datasets:&'a [Dataset],spool:&'a mut Spool}
+impl crate::direct_model_columns::ModelSourcePass for SharedModelSource<'_> {
+    fn initialize(&mut self)->boon_parser::Result<boon_parser::Context> {self.demo.parser.parse_init()}
+    fn scan(&mut self,classes:&HashSet<&str>,events:&HashSet<u32>,visit:&mut crate::direct_model_columns::ModelSourceCallback<'_>)->PyResult<f64> {
+        Python::attach(|py|self.demo.collect_datasets_with_observer(py,self.datasets,Some(&mut *self.spool),Some(classes),Some(events),Some(visit)))
+    }
+    fn collect_without_model(&mut self)->PyResult<()> {
+        Python::attach(|py|self.demo.collect_datasets(py,self.datasets,Some(&mut *self.spool)))
     }
 }
 
@@ -168,15 +192,39 @@ impl Demo {
     }
     /// Independently qualify narrow bounded event cohorts using the same
     /// collectors as bounded_replay_spool and the legacy dataset APIs.
-    #[pyo3(signature = (path, *, datasets, progress=None))]
-    pub(crate) fn bounded_dataset_spool(&mut self,py:Python<'_>,path:&str,datasets:Vec<String>,progress:Option<Py<PyAny>>)->PyResult<String> {
-        let allowed=["objectives","damage","kills","abilities","ability_upgrades","resource_events","soul_bag_pickups","active_modifiers","ability_ticks","sinners_sacrifice","neutrals","mid_boss"];
+    #[pyo3(signature = (path, *, datasets, progress=None, optional_events=false))]
+    pub(crate) fn bounded_dataset_spool(&mut self,py:Python<'_>,path:&str,datasets:Vec<String>,progress:Option<Py<PyAny>>,optional_events:bool)->PyResult<String> {
+        let allowed=["objectives","damage","kills","abilities","ability_upgrades","resource_events","soul_bag_pickups","active_modifiers","ability_ticks","sinners_sacrifice","neutrals","mid_boss","rift","item_purchases"];
         if datasets.iter().any(|name|!allowed.contains(&name.as_str())) {return Err(pyo3::exceptions::PyValueError::new_err("unsupported bounded event cohort"));}
         let datasets:Vec<Dataset>=datasets.iter().map(|name|name.parse()).collect::<PyResult<_>>()?;
         let mut spool=Spool::new(Path::new(path),progress)?;
+        spool.optional_events=optional_events;
+        spool.decode_cohorts.push(datasets.iter().map(|dataset|dataset.as_str().to_owned()).collect());
         self.collect_datasets(py,&datasets,Some(&mut spool))?;
         spool.owner_status=Some(self.bounded_owner_status());
         spool.finish()
+    }
+    /// Collect full model columns and bounded recorded events in one source pass.
+    /// Event rows use the same collectors as bounded_dataset_spool. The event
+    /// destination must not exist. Its completion receipt is written last.
+    #[pyo3(signature = (path, *, ticks, entity_classes=None, datasets=None, progress=None, optional_events=false, method_profile=false))]
+    pub(crate) fn direct_model_columns_and_events(
+        &mut self,py:Python<'_>,path:&str,ticks:Vec<i32>,entity_classes:Option<HashMap<i64,String>>,
+        datasets:Option<Vec<String>>,progress:Option<Py<PyAny>>,optional_events:bool,method_profile:bool,
+    )->PyResult<(Py<PyDict>,String)> {
+        if method_profile&&!crate::direct_method_profile::AVAILABLE {
+            return Err(pyo3::exceptions::PyValueError::new_err("method profiling requires an artifact built with direct-method-profile"));
+        }
+        let names=datasets.unwrap_or_else(||vec!["damage".into(),"abilities".into(),"resource_events".into()]);
+        let datasets=combined_event_datasets(&names)?;
+        let mut spool=Spool::new(Path::new(path),progress)?;
+        spool.optional_events=optional_events;
+        spool.shared_model_columns=true;
+        spool.decode_cohorts.push(datasets.iter().map(|dataset|dataset.as_str().to_owned()).collect());
+        let source=SharedModelSource {demo:self,datasets:&datasets,spool:&mut spool};
+        let frames=crate::direct_model_columns::collect_model_columns(py,ticks,entity_classes,method_profile,source)?;
+        spool.owner_status=Some(self.bounded_owner_status());
+        Ok((frames,spool.finish()?))
     }
     pub(crate) fn bounded_memory_status(&self)->String {self.bounded_owner_status().to_string()}
     pub(crate) fn release_import_outputs(&mut self) {
@@ -428,3 +476,7 @@ impl NativeSpoolReader {
         Ok((pyo3::types::PyBytes::new(py,&tables).unbind(),pyo3::types::PyBytes::new(py,&times).unbind()))
     }
 }
+
+#[cfg(test)]
+#[path="shared_source_pass_tests.rs"]
+mod shared_source_pass_tests;

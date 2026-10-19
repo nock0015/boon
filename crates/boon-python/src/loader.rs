@@ -37,7 +37,32 @@ impl Demo {
         self.collect_datasets(py, datasets, None)
     }
 
-    pub(super) fn collect_datasets(&mut self, py: Python<'_>, datasets: &[Dataset], mut spool: Option<&mut crate::bounded_spool::Spool>) -> PyResult<()> {
+    pub(super) fn collect_datasets(&mut self, py: Python<'_>, datasets: &[Dataset], spool: Option<&mut crate::bounded_spool::Spool>) -> PyResult<()> {
+        self.collect_datasets_with_observer(py,datasets,spool,None,None,None).map(|_|())
+    }
+
+    /// Dispatch an additional source consumer without replacing any collector.
+    /// Filters are unions. The observer runs before the retained collectors and
+    /// before the same completed tick can trigger a bounded flush.
+    pub(super) fn collect_datasets_with_observer(
+        &mut self, py: Python<'_>, datasets: &[Dataset], mut spool: Option<&mut crate::bounded_spool::Spool>,
+        extra_classes:Option<&HashSet<&str>>, extra_events:Option<&HashSet<u32>>,
+        mut observer:Option<&mut crate::direct_model_columns::ModelSourceCallback<'_>>,
+    ) -> PyResult<f64> {
+        // Exclusive wall-time accounting for the existing event export pass.
+        // Collector buckets include retained/fork source-qualification code;
+        // they are not a stock-vs-fork performance baseline.
+        #[cfg(feature="direct-method-profile")]let profile_total_start=std::time::Instant::now();
+        #[cfg(feature="direct-method-profile")]let mut profile_callback_seconds=0_f64;
+        #[cfg(feature="direct-method-profile")]let mut profile_observer_seconds=0_f64;
+        #[cfg(feature="direct-method-profile")]let shared_pass=observer.is_some();
+        #[cfg(feature="direct-method-profile")]let mut profile_entity_seconds=0_f64;
+        #[cfg(feature="direct-method-profile")]let mut profile_optional_seconds=0_f64;
+        #[cfg(feature="direct-method-profile")]let mut profile_flush_seconds=0_f64;
+        #[cfg(feature="direct-method-profile")]let mut profile_flush_in_scan_seconds=0_f64;
+        #[cfg(feature="direct-method-profile")]let mut profile_callbacks=0_u64;
+        #[cfg(feature="direct-method-profile")]let mut profile_events=0_u64;
+        #[cfg(feature="direct-method-profile")]let mut profile_flush_calls=0_u64;
         let optional_events=spool.as_ref().is_some_and(|s|s.optional_events);
         let mut optional_breakables=crate::optional_events::Collector::default();
         // Check game mode for street brawl datasets
@@ -109,8 +134,9 @@ impl Demo {
             && !load_street_brawl_ticks
             && !load_street_brawl_rounds
             && !load_rift
+            && observer.is_none()
         {
-            return Ok(());
+            return Ok(0.);
         }
 
         // Resolve once, before advancing the parser, so acquisition failures are retryable.
@@ -162,14 +188,14 @@ impl Demo {
             && !load_street_brawl_ticks
             && !load_street_brawl_rounds
             && !load_rift;
-        if only_snapshots {
+        if only_snapshots && observer.is_none() {
             return py.detach(|| {
                 self.ensure_snapshots(SnapWants {
                     player_ticks: load_player_ticks,
                     world_ticks: load_world_ticks,
                     troopers: load_troopers,
                 })
-            });
+            }).map(|_|0.);
         }
         // A mixed request used to collect snapshots in the serial entity/event
         // pass, forfeiting the keyframe-segmented speedup. Keep snapshots on
@@ -191,7 +217,7 @@ impl Demo {
             None
         };
 
-        let need_events = load_abilities
+        let need_events = observer.is_some() || load_abilities
             || load_kills
             || load_damage
             || load_resources
@@ -241,6 +267,12 @@ impl Demo {
         if load_street_brawl_rounds {
             event_types.insert(Msg::KEUserMsgStreetBrawlScoring as u32);
         }
+
+        // Companion messages must not change retained collector batch boundaries.
+        // Bag/resource linking uses those boundaries, so only the original event
+        // filter contributes source bytes or reaches retained event dispatch.
+        let retained_event_types=extra_events.map(|_|event_types.clone());
+        if let Some(extra_events)=extra_events {event_types.extend(extra_events.iter().copied());}
 
         // ability_ticks needs every ability *entity* class decoded. There are
         // hundreds (one per ability), so collect their names from the send tables
@@ -338,7 +370,8 @@ impl Demo {
             Vec::new()
         };
         class_names.extend(endpoint_classes.iter().map(String::as_str));
-        let class_filter: std::collections::HashSet<&str> = class_names.into_iter().collect();
+        let mut class_filter: std::collections::HashSet<&str> = class_names.into_iter().collect();
+        if let Some(extra_classes)=extra_classes {class_filter.extend(extra_classes.iter().copied());}
         let mut resource_rows = Vec::new();
         let mut resource_sequence = 0u64;
         let mut soul_bag_rows = Vec::new();
@@ -495,14 +528,16 @@ impl Demo {
 
         // ── Column vectors for ability_ticks (entity change detection) ──
         let mut at_tick: Vec<i32> = Vec::new();
+        let mut at_entity_index: Vec<i32> = Vec::new();
+        let mut at_entity_serial: Vec<u32> = Vec::new();
         let mut at_hero_id: Vec<i64> = Vec::new();
         let mut at_ability_id: Vec<u32> = Vec::new();
         let mut at_slot: Vec<i32> = Vec::new();
-        let mut at_cooldown_start: Vec<f32> = Vec::new();
-        let mut at_cooldown_end: Vec<f32> = Vec::new();
-        let mut at_remaining_charges: Vec<i32> = Vec::new();
-        let mut at_charge_recharge_start: Vec<f32> = Vec::new();
-        let mut at_charge_recharge_end: Vec<f32> = Vec::new();
+        let mut at_cooldown_start: Vec<Option<f32>> = Vec::new();
+        let mut at_cooldown_end: Vec<Option<f32>> = Vec::new();
+        let mut at_remaining_charges: Vec<Option<i32>> = Vec::new();
+        let mut at_charge_recharge_start: Vec<Option<f32>> = Vec::new();
+        let mut at_charge_recharge_end: Vec<Option<f32>> = Vec::new();
         // ── Column vectors for street_brawl_ticks ──
         let sbt_capacity = if load_street_brawl_ticks {
             self.total_ticks as usize
@@ -627,14 +662,15 @@ impl Demo {
         }
         #[derive(PartialEq)]
         struct AbilState {
-            cooldown_start: f32,
-            cooldown_end: f32,
-            remaining_charges: i32,
-            recharge_start: f32,
-            recharge_end: f32,
+            hero_id: i64, ability_id: u32, slot: i32,
+            cooldown_start: Option<f32>,
+            cooldown_end: Option<f32>,
+            remaining_charges: Option<i32>,
+            recharge_start: Option<f32>,
+            recharge_end: Option<f32>,
         }
         let mut ability_keys_cache: HashMap<String, AbilityKeys> = HashMap::new();
-        let mut abil_prev: HashMap<i32, AbilState> = HashMap::new();
+        let mut abil_prev: HashMap<boon_parser::EntityId, AbilState> = HashMap::new();
 
         // Cache full carrier identity for removals after a pawn disappears.
         let mut urn_owners: HashMap<u32, (i64, [f32; 3])> = HashMap::new();
@@ -781,7 +817,7 @@ impl Demo {
 
         macro_rules! collect_entity_data {
             ($ctx:expr) => {
-                if optional_events {optional_breakables.lifecycle($ctx);}
+                if optional_events {#[cfg(feature="direct-method-profile")]let timer=std::time::Instant::now();optional_breakables.lifecycle($ctx);#[cfg(feature="direct-method-profile")]{profile_optional_seconds+=timer.elapsed().as_secs_f64();}}
                 if load_sinners_sacrifice
                     && sn_pending_tick.is_some()
                     && sn_pending_tick != Some($ctx.tick())
@@ -1461,33 +1497,29 @@ impl Demo {
                         if keys.cooldown_end.is_none() || keys.remaining_charges.is_none() {
                             continue;
                         }
-                        let hero_id = entity
-                            .get_handle(keys.owner)
-                            .map(|h| (h & boon_parser::ENTITY_HANDLE_INDEX_MASK) as i32)
-                            .and_then(|owner_idx| entity_to_hero.get(&owner_idx).copied())
-                            .unwrap_or(0);
-                        if hero_id == 0 {
-                            continue;
-                        }
+                        let hero_id = entity.get_handle(keys.owner)
+                            .and_then(|h| $ctx.entities().get_by_handle(h))
+                            .and_then(|pawn| snapshots::source_int(pawn,pk_hero_id)).unwrap_or(0);
+                        if hero_id == 0 { continue; }
+                        let Some(ability_id) = snapshots::source_int(entity,keys.subclass_id).and_then(|v|u32::try_from(v).ok()) else {continue};
+                        let Some(slot) = snapshots::source_int(entity,keys.slot).and_then(|v|i32::try_from(v).ok()) else {continue};
+                        let identity = boon_parser::EntityId::new(entity.index,entity.serial);
                         let state = AbilState {
-                            cooldown_start: entity.get_f32(keys.cooldown_start),
-                            cooldown_end: entity.get_f32(keys.cooldown_end),
-                            remaining_charges: entity.get_i64(keys.remaining_charges) as i32,
-                            recharge_start: entity.get_f32(keys.recharge_start),
-                            recharge_end: entity.get_f32(keys.recharge_end),
+                            hero_id, ability_id, slot,
+                            cooldown_start: snapshots::source_float(entity,keys.cooldown_start),
+                            cooldown_end: snapshots::source_float(entity,keys.cooldown_end),
+                            remaining_charges: snapshots::source_int(entity,keys.remaining_charges).and_then(|v|i32::try_from(v).ok()),
+                            recharge_start: snapshots::source_float(entity,keys.recharge_start),
+                            recharge_end: snapshots::source_float(entity,keys.recharge_end),
                         };
-                        let changed = abil_prev.get(&idx).map(|p| *p != state).unwrap_or(true);
+                        let changed = abil_prev.get(&identity).map(|p| *p != state).unwrap_or(true);
                         if changed {
-                            at_tick.push($ctx.tick());
-                            at_hero_id.push(hero_id);
-                            at_ability_id.push(entity.get_u32(keys.subclass_id));
-                            at_slot.push(entity.get_i64(keys.slot) as i32);
-                            at_cooldown_start.push(state.cooldown_start);
-                            at_cooldown_end.push(state.cooldown_end);
+                            at_tick.push($ctx.tick()); at_entity_index.push(entity.index); at_entity_serial.push(entity.serial);
+                            at_hero_id.push(hero_id); at_ability_id.push(ability_id); at_slot.push(slot);
+                            at_cooldown_start.push(state.cooldown_start); at_cooldown_end.push(state.cooldown_end);
                             at_remaining_charges.push(state.remaining_charges);
-                            at_charge_recharge_start.push(state.recharge_start);
-                            at_charge_recharge_end.push(state.recharge_end);
-                            abil_prev.insert(idx, state);
+                            at_charge_recharge_start.push(state.recharge_start); at_charge_recharge_end.push(state.recharge_end);
+                            abil_prev.insert(identity, state);
                         }
                     }
                 }
@@ -1777,7 +1809,7 @@ impl Demo {
         let parser = &self.parser;
         let mut spool_error: Option<PyErr> = None;
         let mut batch_source_bytes=0usize;
-        macro_rules! flush_columns { () => { (|| -> PyResult<()> {
+        macro_rules! flush_columns { () => {{ #[cfg(feature="direct-method-profile")]let profile_flush_start=std::time::Instant::now(); let result=(|| -> PyResult<()> {
         // ── Build and cache DataFrames ──
 
         if load_kills {
@@ -1961,6 +1993,16 @@ impl Demo {
             ])
             .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))?;
             if optional_events {df.with_column(Column::new("optional_breakable_sequence".into(),raw_damage_events.iter().map(|r|r.optional_breakable_sequence).collect::<Vec<_>>())).map_err(|e|InvalidDemoError::new_err(e.to_string()))?;}
+            // Explicit source availability: legacy numeric defaults are not evidence.
+            for (name, selector) in [
+                ("damage_available", 0u8), ("is_melee_available", 1u8), ("ability_id_available", 2u8),
+            ] {
+                let flags=raw_damage_events.iter().map(|r|r.event.message.as_ref().is_ok_and(|m|match selector {
+                    0=>m.damage.is_some(),1=>m.citadel_type.is_some()&&m.flags.is_some(),_=>m.ability_id.is_some()
+                })).collect::<Vec<_>>();
+                df.with_column(Column::new(name.into(),flags)).map_err(|e|InvalidDemoError::new_err(e.to_string()))?;
+            }
+
             if let Some(sink) = spool.as_deref_mut() { sink.write(Dataset::Damage.as_str(), df)?; } else { cache[Dataset::Damage] = Some(df); }
         }
 
@@ -2131,6 +2173,8 @@ impl Demo {
         if load_ability_ticks {
             let df = df_from_columns(vec![
                 Column::new("tick".into(), std::mem::take(&mut at_tick)),
+                Column::new("entity_index".into(), std::mem::take(&mut at_entity_index)),
+                Column::new("entity_serial".into(), std::mem::take(&mut at_entity_serial)),
                 Column::new("hero_id".into(), std::mem::take(&mut at_hero_id)),
                 Column::new("ability_id".into(), std::mem::take(&mut at_ability_id)),
                 Column::new("slot".into(), std::mem::take(&mut at_slot)),
@@ -2209,7 +2253,7 @@ impl Demo {
         }}
         raw_kill_events.clear(); raw_damage_events.clear();batch_source_bytes=0;
             Ok(())
-        })() }; }
+        })(); #[cfg(feature="direct-method-profile")]{profile_flush_seconds+=profile_flush_start.elapsed().as_secs_f64();}#[cfg(feature="direct-method-profile")]{profile_flush_calls+=1;}result }}; }
         macro_rules! maybe_flush { () => {
             if let Some(sink)=spool.as_deref_mut() {if let Err(error)=sink.check_cancel() {spool_error=Some(error);}}
             if spool.is_some() && (batch_source_bytes>=4*1024*1024 || raw_kill_events.len() + raw_damage_events.len() + resource_rows.len() + soul_bag_rows.len() + ability_ticks.len() + au_ticks.len() + obj_tick.len() + nt_tick.len() + sn_tick.len() + am_tick.len() + at_tick.len() + mb_ticks.len() + ip_ticks.len() + urn_tick.len() + optional_breakables.rows.len() >= 1024) {
@@ -2217,6 +2261,7 @@ impl Demo {
             }
         }; }
         // ── Run the parse pass ──
+        #[cfg(feature="direct-method-profile")]let profile_scan_start=std::time::Instant::now();
         if need_events {
             py.detach(|| {
                 parser.try_run_to_end_with_event_types_filtered(
@@ -2224,10 +2269,21 @@ impl Demo {
                     &event_types,
                     |ctx, events| {
                         if spool_error.is_some() { return Err(crate::bounded_spool::aborted()); }
-                        batch_source_bytes=batch_source_bytes.saturating_add(events.iter().map(|event|event.payload.len()).sum::<usize>());
+                        if let Some(visit)=observer.as_deref_mut() {
+                            #[cfg(feature="direct-method-profile")]let started=std::time::Instant::now();
+                            let result=visit(ctx,events);
+                            #[cfg(feature="direct-method-profile")]{profile_observer_seconds+=started.elapsed().as_secs_f64();}
+                            result?;
+                        }
+                        #[cfg(feature="direct-method-profile")]let profile_callback_start=std::time::Instant::now();#[cfg(feature="direct-method-profile")]{profile_callbacks+=1;}#[cfg(feature="direct-method-profile")]{profile_events+=events.iter().filter(|event|retained_event_types.as_ref().is_none_or(|types|types.contains(&event.msg_type))).count() as u64;}
+                        #[cfg(feature="direct-method-profile")]let profile_flush_before=profile_flush_seconds;
+                        if spool_error.is_some() { return Err(crate::bounded_spool::aborted()); }
+                        batch_source_bytes=batch_source_bytes.saturating_add(events.iter().filter(|event|retained_event_types.as_ref().is_none_or(|types|types.contains(&event.msg_type))).map(|event|event.payload.len()).sum::<usize>());
+                        #[cfg(feature="direct-method-profile")]let profile_entity_start=std::time::Instant::now();
                         collect_entity_data!(ctx);
+                        #[cfg(feature="direct-method-profile")]{profile_entity_seconds+=profile_entity_start.elapsed().as_secs_f64();}
 
-                        for event in events {
+                        for event in events.iter().filter(|event|retained_event_types.as_ref().is_none_or(|types|types.contains(&event.msg_type))) {
                             if load_resources
                                 && event.msg_type == Msg::KEUserMsgSoulBagPickup as u32
                             {
@@ -2418,7 +2474,7 @@ impl Demo {
                                         .as_ref()
                                         .ok()
                                         .and_then(|msg| endpoint(msg.entindex_victim));
-                                    let optional_breakable_sequence=if optional_events {message.as_ref().ok().and_then(|msg|optional_breakables.damage(ctx,event.tick,msg))}else{None};
+                                    let optional_breakable_sequence=if optional_events {#[cfg(feature="direct-method-profile")]let timer=std::time::Instant::now();let value=message.as_ref().ok().and_then(|msg|optional_breakables.damage(ctx,event.tick,msg));#[cfg(feature="direct-method-profile")]{profile_optional_seconds+=timer.elapsed().as_secs_f64();}value}else{None};
                                     raw_damage_events.push(RawDamageEvent {
                                         optional_breakable_sequence,
                                         attacker_endpoint,
@@ -2593,6 +2649,8 @@ impl Demo {
                             }
                         }
                         maybe_flush!();
+                        #[cfg(feature="direct-method-profile")]{profile_flush_in_scan_seconds+=profile_flush_seconds-profile_flush_before;}
+                        #[cfg(feature="direct-method-profile")]{profile_callback_seconds+=profile_callback_start.elapsed().as_secs_f64();}
                         if spool_error.is_some() {Err(crate::bounded_spool::aborted())} else {Ok(())}
                     },
                 )
@@ -2601,15 +2659,29 @@ impl Demo {
         } else {
             py.detach(|| {
                 parser.try_run_to_end_filtered(&class_filter, |ctx| {
+                    #[cfg(feature="direct-method-profile")]let profile_callback_start=std::time::Instant::now();#[cfg(feature="direct-method-profile")]{profile_callbacks+=1;}#[cfg(feature="direct-method-profile")]let profile_flush_before=profile_flush_seconds;
                     if spool_error.is_some() { return Err(crate::bounded_spool::aborted()); }
-                    collect_entity_data!(ctx);
+                    #[cfg(feature="direct-method-profile")]let profile_entity_start=std::time::Instant::now();collect_entity_data!(ctx);#[cfg(feature="direct-method-profile")]{profile_entity_seconds+=profile_entity_start.elapsed().as_secs_f64();}
                     maybe_flush!();
+                    #[cfg(feature="direct-method-profile")]{profile_flush_in_scan_seconds+=profile_flush_seconds-profile_flush_before;}
+                    #[cfg(feature="direct-method-profile")]{profile_callback_seconds+=profile_callback_start.elapsed().as_secs_f64();}
                     if spool_error.is_some() {Err(crate::bounded_spool::aborted())} else {Ok(())}
                 })
             })
             .map_err(|e|spool_error.take().unwrap_or_else(||to_py_err(e)))?;
         }
 
+        #[cfg(feature="direct-method-profile")]let profile_scan_seconds=profile_scan_start.elapsed().as_secs_f64();
+        // Retain unfinished live Rift evidence at its actual transition ticks.
+        // No synthetic expiry or winner is created at end-of-replay.
+        if load_rift && rift_live {
+            rift_counter += 1; rift_num.push(rift_counter);
+            rift_announce_tick.push(rift_cur_announce); rift_active_tick.push(rift_cur_active_tick);
+            rift_capture_tick.push(rift_cur_capture_tick); rift_expire_tick.push(None);
+            rift_winning_team.push(rift_cur_winning_team);
+            rift_lane.push(rift_lane_for(rift_cur_loc[0],rift_cur_loc[1]));
+            rift_x.push(rift_cur_loc[0]);rift_y.push(rift_cur_loc[1]);rift_z.push(rift_cur_loc[2]);
+        }
         if let Some(error) = spool_error { return Err(error); }
         if let Some(error)=optional_purchase_error {return Err(DemoMessageError::new_err(format!("Failed to decode optional AbilitiesChanged: {error}")));}
         if load_sinners_sacrifice {
@@ -2657,15 +2729,34 @@ impl Demo {
             let version=replay_catalog_version(game_directory.as_deref());
             sink.optional_coverage=Some(serde_json::json!({
                 "replayVersion":version,
-                "item_purchases":{"collected":true,"supported":version.is_some(),"source":"AbilitiesChanged","scope":"recorded purchaser only; raw enum; no inventory-diff purchases"},
-                "breakable_events":{"collected":true,"supported":optional_breakables.class_available,"source":"CCitadel_BreakableProp + Damage","scope":"recorded lifecycle and exact damage endpoints; no inferred destruction, loot, intention, or team visibility"},
-                "urn":{"collected":true,"supported":urn_state.is_some(),"source":"replay-version modifier catalog","scope":"effective modifier carrier-state transitions, including causal expiry/catalog removals; not voluntary actions; exact full-handle identity; owner-known carrier state"}
+                "item_purchases":{"collected":load_item_purchases,"supported":version.is_some(),"source":"AbilitiesChanged","scope":"recorded purchaser only; raw enum; no inventory-diff purchases"},
+                "breakable_events":{"collected":load_damage,"supported":optional_breakables.class_available,"source":"CCitadel_BreakableProp + Damage","scope":"recorded lifecycle and exact damage endpoints; no inferred destruction, loot, intention, or team visibility"},
+                "urn":{"collected":load_urn,"supported":urn_state.is_some(),"source":"replay-version modifier catalog","scope":"effective modifier carrier-state transitions, including causal expiry/catalog removals; not voluntary actions; exact full-handle identity; owner-known carrier state"}
             }));
         }}
         flush_columns!()?;
         if load_kills {if let Some(sink) = spool.as_deref_mut() { sink.kill_identities(&entity_to_hero)?; }}
+        #[cfg(feature="direct-method-profile")]
+        if let Some(sink)=spool.as_deref_mut() {
+            let total=profile_total_start.elapsed().as_secs_f64()-profile_observer_seconds;
+            // Entity and event callbacks form one retained-collector bucket;
+            // the optional fork lifecycle/damage and dataframe/IPC flush work
+            // are removed explicitly to avoid inclusive double counting.
+            let phases=[
+                ("parser.scan_dispatch_shared_residual",profile_scan_seconds-profile_callback_seconds-profile_observer_seconds,profile_callbacks,"source_ticks"),
+                ("retained_collectors.callback_excluding_optional_and_flush",profile_callback_seconds-profile_optional_seconds-profile_flush_in_scan_seconds,profile_callbacks,"source_ticks"),
+                ("fork.optional_breakable_lifecycle_and_damage",profile_optional_seconds,profile_callbacks,"source_ticks_with_optional_check"),
+                ("retained_collectors.finalize_dataframe_and_spool",profile_flush_seconds,profile_flush_calls,"flush_calls"),
+                ("integration.setup_finalization_unresolved",total-(profile_scan_seconds-profile_observer_seconds)-(profile_flush_seconds-profile_flush_in_scan_seconds),1,"export_calls"),
+            ];
+            sink.event_profile.push(serde_json::json!({"schema":"boon-event-exclusive-profile-v1","total_seconds":total,"source_ticks":profile_callbacks,"source_events":profile_events,"entity_callback_seconds_inclusive":profile_entity_seconds,"scan_seconds_inclusive":profile_scan_seconds-profile_observer_seconds,"shared_pass":shared_pass,"model_observer_seconds_excluded":profile_observer_seconds,"callback_seconds_inclusive":profile_callback_seconds,"phases":phases.iter().map(|(name,seconds,calls,unit)|serde_json::json!({"phase":name,"seconds":seconds,"calls":calls,"count_unit":unit,"exclusive":true,"negative_accounting_error":*seconds<0.})).collect::<Vec<_>>(),"provenance":"retained loader collectors plus fork source qualification; optional collector separately timed; not a paired stock benchmark"}));
+        }
 
-        Ok(())
+
+        #[cfg(feature="direct-method-profile")]
+        {Ok(profile_total_start.elapsed().as_secs_f64()-profile_scan_seconds+profile_callback_seconds)}
+        #[cfg(not(feature="direct-method-profile"))]
+        {Ok(0.0)} // Compatibility return: no timing was collected.
     }
 }
 

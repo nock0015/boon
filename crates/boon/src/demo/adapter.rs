@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use boon_proto::proto::{
     CDemoClassInfo, CDemoFullPacket, CDemoPacket, CDemoSendTables, CMsgSource1LegacyGameEvent,
-    CMsgSource1LegacyGameEventList, CitadelUserMessageIds, CsvcMsgCreateStringTable,
+    CMsgSource1LegacyGameEventList, CitadelUserMessageIds, CitadelEntityMessageIds, CsvcMsgCreateStringTable,
     CsvcMsgFlattenedSerializer, CsvcMsgPacketEntities, CsvcMsgServerInfo, CsvcMsgUpdateStringTable,
     CsvcMsgUserMessage, EBaseUserMessages, ECitadelGameEvents,
 };
@@ -309,8 +309,9 @@ impl CitadelAdapter {
 
 fn direct_event_name(message_type: u32) -> Option<String> {
     let message_type = message_type as i32;
-    CitadelUserMessageIds::try_from(message_type)
+    CitadelEntityMessageIds::try_from(message_type)
         .map(|event| event.as_str_name().to_string())
+        .or_else(|_| CitadelUserMessageIds::try_from(message_type).map(|event| event.as_str_name().to_string()))
         .or_else(|_| {
             ECitadelGameEvents::try_from(message_type).map(|event| event.as_str_name().to_string())
         })
@@ -422,5 +423,13 @@ mod checkpoint_tests {
         assert_eq!(restored.event_types, Some(HashSet::from([42])));
         assert!(restored.packet_body.is_empty());
         assert!(restored.tick_events.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod direct_entity_message_tests {
+    #[test]
+    fn breakable_debris_is_a_recognized_native_message() {
+        assert_eq!(super::direct_event_name(500).as_deref(), Some("k_EEntityMsg_BreakablePropSpawnDebris"));
     }
 }
