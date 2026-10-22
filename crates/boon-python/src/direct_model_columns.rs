@@ -4,8 +4,11 @@ use crate::*;
 use boon_parser::{Context,Entity,FieldValue};
 use std::collections::BTreeMap;
 use std::time::Instant;
+#[path="elapsed_play_clock.rs"]mod elapsed_play_clock;
+use elapsed_play_clock::CaptureStamp;
+const SOURCE_CAPTURE:usize=0;const MAP_CAPTURE:usize=1;const HEALTH_CAPTURE:usize=2;const WORLD_CAPTURE:usize=3;const POSITION_OBSERVATION_CAPTURE:usize=4;const POSITION_EMITTED_CAPTURE:usize=5;
 
-// All diagnostic clocks compile out of production. Only signal polling uses Instant.
+// Diagnostic clocks compile out of production. Signal and optional progress polling use Instant.
 #[derive(Clone,Copy)]
 struct FineInstant {
  #[cfg(any(feature="direct-method-profile",test))] start:Instant,
@@ -153,15 +156,15 @@ fn objective(class:&str)->bool{let _method_span=crate::direct_method_profile::sp
 fn objective_code(class:&str)->&'static str{let _method_span=crate::direct_method_profile::span(24);match class{"CNPC_TrooperBoss"=>"CLASS_TROOPER_BOSS","CNPC_Boss_Tier2"=>"CLASS_BOSS_TIER_2","CNPC_Boss_Tier3"=>"CLASS_BOSS_TIER_3","CNPC_BarrackBoss"=>"CLASS_BOSS_BARRACKS","CCitadel_Destroyable_Building"=>"CLASS_DESTROYABLE_BUILDING","CNPC_MidBoss"=>"CLASS_MID_BOSS",_=>""}}
 
 include!("direct_shared_payload.rs");
-struct Node {key:String,kind:String,class:Option<String>,id:Option<Id>,owner:Option<u64>,team:Option<i64>,hero:Option<i64>,ability:Option<i64>,audience:i32,observer:Option<i64>,active:bool,values:[Option<f64>;66],extras:SharedExtras,relations:SharedRelations,source_time:Option<f64>,map_time:Option<f64>,health_time:Option<f64>,world_time:Option<f64>,position_observation_time:Option<f64>,position_observation_live:bool,position_emitted_time:Option<f64>}
-impl Clone for Node {fn clone(&self)->Self{let _method_span=crate::direct_method_profile::span(25);Self{key:self.key.clone(),kind:self.kind.clone(),class:self.class.clone(),id:self.id.clone(),owner:self.owner.clone(),team:self.team.clone(),hero:self.hero.clone(),ability:self.ability.clone(),audience:self.audience.clone(),observer:self.observer.clone(),active:self.active.clone(),values:self.values.clone(),extras:self.extras.clone(),relations:self.relations.clone(),source_time:self.source_time.clone(),map_time:self.map_time.clone(),health_time:self.health_time.clone(),world_time:self.world_time.clone(),position_observation_time:self.position_observation_time.clone(),position_observation_live:self.position_observation_live.clone(),position_emitted_time:self.position_emitted_time.clone()}}}
-impl PartialEq for Node {fn eq(&self,other:&Self)->bool{let _method_span=crate::direct_method_profile::span(26);self.key==other.key&&self.kind==other.kind&&self.class==other.class&&self.id==other.id&&self.owner==other.owner&&self.team==other.team&&self.hero==other.hero&&self.ability==other.ability&&self.audience==other.audience&&self.observer==other.observer&&self.active==other.active&&self.values==other.values&&self.extras==other.extras&&self.relations==other.relations&&self.source_time==other.source_time&&self.map_time==other.map_time&&self.health_time==other.health_time&&self.world_time==other.world_time&&self.position_observation_time==other.position_observation_time&&self.position_observation_live==other.position_observation_live&&self.position_emitted_time==other.position_emitted_time}}
+struct Node {capture_stamps:[CaptureStamp;6],emission_clock:CaptureStamp,e1_time_available:bool,key:String,kind:String,class:Option<String>,id:Option<Id>,owner:Option<u64>,team:Option<i64>,hero:Option<i64>,ability:Option<i64>,audience:i32,observer:Option<i64>,active:bool,values:[Option<f64>;66],extras:SharedExtras,relations:SharedRelations,source_time:Option<f64>,map_time:Option<f64>,health_time:Option<f64>,world_time:Option<f64>,position_observation_time:Option<f64>,position_observation_live:bool,position_emitted_time:Option<f64>}
+impl Clone for Node {fn clone(&self)->Self{let _method_span=crate::direct_method_profile::span(25);Self{capture_stamps:self.capture_stamps,emission_clock:self.emission_clock,e1_time_available:self.e1_time_available,key:self.key.clone(),kind:self.kind.clone(),class:self.class.clone(),id:self.id.clone(),owner:self.owner.clone(),team:self.team.clone(),hero:self.hero.clone(),ability:self.ability.clone(),audience:self.audience.clone(),observer:self.observer.clone(),active:self.active.clone(),values:self.values.clone(),extras:self.extras.clone(),relations:self.relations.clone(),source_time:self.source_time.clone(),map_time:self.map_time.clone(),health_time:self.health_time.clone(),world_time:self.world_time.clone(),position_observation_time:self.position_observation_time.clone(),position_observation_live:self.position_observation_live.clone(),position_emitted_time:self.position_emitted_time.clone()}}}
+impl PartialEq for Node {fn eq(&self,other:&Self)->bool{let _method_span=crate::direct_method_profile::span(26);self.capture_stamps==other.capture_stamps&&self.key==other.key&&self.kind==other.kind&&self.class==other.class&&self.id==other.id&&self.owner==other.owner&&self.team==other.team&&self.hero==other.hero&&self.ability==other.ability&&self.audience==other.audience&&self.observer==other.observer&&self.active==other.active&&self.values==other.values&&self.extras==other.extras&&self.relations==other.relations&&self.source_time==other.source_time&&self.map_time==other.map_time&&self.health_time==other.health_time&&self.world_time==other.world_time&&self.position_observation_time==other.position_observation_time&&self.position_observation_live==other.position_observation_live&&self.position_emitted_time==other.position_emitted_time}}
 
 impl Node {
  // Exact append equality after four observation timestamps are normalized.
- fn same_observation_content(&self,other:&Self)->bool{[self.map_time,self.health_time,self.world_time,self.position_observation_time].into_iter().all(|v|v.is_none_or(|v|!v.is_nan()))&&self.key==other.key&&self.kind==other.kind&&self.class==other.class&&self.id==other.id&&self.owner==other.owner&&self.team==other.team&&self.hero==other.hero&&self.ability==other.ability&&self.audience==other.audience&&self.observer==other.observer&&self.active==other.active&&self.values==other.values&&self.extras==other.extras&&self.relations==other.relations&&self.source_time==other.source_time&&self.position_observation_live==other.position_observation_live&&self.position_emitted_time==other.position_emitted_time}
+ fn same_observation_content(&self,other:&Self)->bool{[self.map_time,self.health_time,self.world_time,self.position_observation_time].into_iter().all(|v|v.is_none_or(|v|!v.is_nan()))&&self.capture_stamps[SOURCE_CAPTURE]==other.capture_stamps[SOURCE_CAPTURE]&&self.capture_stamps[POSITION_EMITTED_CAPTURE]==other.capture_stamps[POSITION_EMITTED_CAPTURE]&&self.key==other.key&&self.kind==other.kind&&self.class==other.class&&self.id==other.id&&self.owner==other.owner&&self.team==other.team&&self.hero==other.hero&&self.ability==other.ability&&self.audience==other.audience&&self.observer==other.observer&&self.active==other.active&&self.values==other.values&&self.extras==other.extras&&self.relations==other.relations&&self.source_time==other.source_time&&self.position_observation_live==other.position_observation_live&&self.position_emitted_time==other.position_emitted_time}
 
- fn new(key:String,kind:&str,audience:i32)->Self{let _method_span=crate::direct_method_profile::span(27);Self{key,kind:kind.into(),class:None,id:None,owner:None,team:None,hero:None,ability:None,audience,observer:None,active:true,values:[None;66],extras:SharedExtras::default(),relations:SharedRelations::default(),source_time:None,map_time:None,health_time:None,world_time:None,position_observation_time:None,position_observation_live:false,position_emitted_time:None}}
+ fn new(key:String,kind:&str,audience:i32)->Self{let _method_span=crate::direct_method_profile::span(27);Self{capture_stamps:[CaptureStamp::default();6],emission_clock:CaptureStamp::default(),e1_time_available:false,key,kind:kind.into(),class:None,id:None,owner:None,team:None,hero:None,ability:None,audience,observer:None,active:true,values:[None;66],extras:SharedExtras::default(),relations:SharedRelations::default(),source_time:None,map_time:None,health_time:None,world_time:None,position_observation_time:None,position_observation_live:false,position_emitted_time:None}}
  fn entity(e:&Entity,audience:i32)->Self{let _method_span=crate::direct_method_profile::span(28);let mut node=Self::new(physical((e.index,e.serial)),kind(&e.class_name),audience);node.id=Some((e.index,e.serial));node.class=Some(e.class_name.to_string());node}
  fn scope(&self)->Scope{let _method_span=crate::direct_method_profile::span(29);(self.key.clone(),self.audience,self.observer)}
  fn set(&mut self,name:&str,v:Option<f64>){let _method_span=crate::direct_method_profile::span(30);if let Some(j)=feature_index(name){self.values[j]=v.filter(|v|v.is_finite());}}
@@ -289,26 +292,34 @@ impl Profile {
  #[inline(always)]fn elapsed(&mut self,_name:&'static str,_start:impl ProfileClock,_rows:usize){}
 }
 
-struct PositionAnchor {point:[f64;3],life:Option<[Option<f64>;4]>,id:Option<Id>,emitted:Option<f64>,value_observed:Option<f64>,observed:Option<f64>,gap:bool}
-impl Clone for PositionAnchor {fn clone(&self)->Self{let _method_span=crate::direct_method_profile::span(46);Self{point:self.point.clone(),life:self.life.clone(),id:self.id.clone(),emitted:self.emitted.clone(),value_observed:self.value_observed.clone(),observed:self.observed.clone(),gap:self.gap.clone()}}}
+struct PositionAnchor {emitted_capture:CaptureStamp,value_observed_capture:CaptureStamp,observed_capture:CaptureStamp,point:[f64;3],life:Option<[Option<f64>;4]>,id:Option<Id>,emitted:Option<f64>,value_observed:Option<f64>,observed:Option<f64>,gap:bool}
+impl Clone for PositionAnchor {fn clone(&self)->Self{let _method_span=crate::direct_method_profile::span(46);Self{emitted_capture:self.emitted_capture,value_observed_capture:self.value_observed_capture,observed_capture:self.observed_capture,point:self.point.clone(),life:self.life.clone(),id:self.id.clone(),emitted:self.emitted.clone(),value_observed:self.value_observed.clone(),observed:self.observed.clone(),gap:self.gap.clone()}}}
 
 // Only these primitive fields are normalized by append/position policy.
 // Raw projection rows retain original observations between selected ticks.
 #[derive(Clone)]
-struct RawObservation {position:[Option<f64>;4],times:[Option<f64>;6],live:bool,extras:SharedExtras}
+struct RawObservation {capture_stamps:[CaptureStamp;6],emission_clock:CaptureStamp,e1_time_available:bool,position:[Option<f64>;4],times:[Option<f64>;6],live:bool,extras:SharedExtras}
 impl RawObservation {
- fn save(node:&Node)->Self{Self{position:[node.values[0],node.values[1],node.values[2],node.values[38]],times:[node.source_time,node.map_time,node.health_time,node.world_time,node.position_observation_time,node.position_emitted_time],live:node.position_observation_live,extras:node.extras.clone()}}
- fn restore(self,node:&mut Node){for(index,value)in [0,1,2,38].into_iter().zip(self.position){node.values[index]=value;}let [source,map,health,world,observed,emitted]=self.times;node.source_time=source;node.map_time=map;node.health_time=health;node.world_time=world;node.position_observation_time=observed;node.position_emitted_time=emitted;node.position_observation_live=self.live;node.extras=self.extras;}
+ fn save(node:&Node)->Self{Self{capture_stamps:node.capture_stamps,emission_clock:node.emission_clock,e1_time_available:node.e1_time_available,position:[node.values[0],node.values[1],node.values[2],node.values[38]],times:[node.source_time,node.map_time,node.health_time,node.world_time,node.position_observation_time,node.position_emitted_time],live:node.position_observation_live,extras:node.extras.clone()}}
+ fn restore(self,node:&mut Node){node.capture_stamps=self.capture_stamps;node.emission_clock=self.emission_clock;node.e1_time_available=self.e1_time_available;for(index,value)in [0,1,2,38].into_iter().zip(self.position){node.values[index]=value;}let [source,map,health,world,observed,emitted]=self.times;node.source_time=source;node.map_time=map;node.health_time=health;node.world_time=world;node.position_observation_time=observed;node.position_emitted_time=emitted;node.position_observation_live=self.live;node.extras=self.extras;}
 }
 #[derive(Default)]
-struct Collector {projection_restore:Vec<RawObservation>,projection_cache:projection::ProjectionCache,profile:Profile,zip_homes:zipline_reach::Homes,projection_counts:Vec<(i32,[u64;8])>,rows:rows::EmittedRows,history:projection::DenseNodes,retired_history:BTreeMap<Scope,Node>,#[cfg(test)]previous:BTreeMap<Scope,Node>,objective_markers:HashSet<Id>,clock_samples:Vec<bool>,clock_terminal:Vec<bool>,clock_ticks:Vec<i32>,clock_seconds:Vec<Option<f64>>,clock_observed_ticks:Vec<Option<i32>>,last_clock:Option<(f64,i32)>,modifiers:boon_parser::ModifierState,modifier_times:HashMap<u32,Option<f64>>,positions:BTreeMap<Scope,PositionAnchor>,last_projection_time:Option<f64>,field_names:FieldNames,camp_positions:BTreeMap<String,([f64;2],Option<f64>)>}
+struct Collector {elapsed_clock:elapsed_play_clock::Clock,clock_evidence:Vec<elapsed_play_clock::Evidence>,capture_now:CaptureStamp,e1_time_available:bool,last_projection_elapsed:Option<f64>,projection_restore:Vec<RawObservation>,projection_cache:projection::ProjectionCache,profile:Profile,zip_homes:zipline_reach::Homes,projection_counts:Vec<(i32,[u64;8])>,rows:rows::EmittedRows,history:projection::DenseNodes,retired_history:BTreeMap<Scope,Node>,#[cfg(test)]previous:BTreeMap<Scope,Node>,objective_markers:HashSet<Id>,clock_samples:Vec<bool>,clock_terminal:Vec<bool>,clock_ticks:Vec<i32>,clock_seconds:Vec<Option<f64>>,clock_observed_ticks:Vec<Option<i32>>,last_clock:Option<(f64,i32)>,modifiers:boon_parser::ModifierState,modifier_times:HashMap<u32,(Option<f64>,CaptureStamp)>,positions:BTreeMap<Scope,PositionAnchor>,last_projection_time:Option<f64>,field_names:FieldNames,camp_positions:BTreeMap<String,([f64;2],Option<f64>,CaptureStamp)>}
 impl Collector {
+ // Called before selected-tick filtering: modifier observation origins may be unsampled.
+ fn capture_modifier_change(&mut self,serial:u32,kind:boon_parser::ModifierChangeKind,time:Option<f64>){
+  self.projection_cache.modifier_changed(serial);
+  if kind==boon_parser::ModifierChangeKind::Removed{self.modifier_times.remove(&serial);}else{self.modifier_times.insert(serial,(time,self.capture_now));}
+ }
+ fn modifier_origin(&self,serial:u32)->(Option<f64>,CaptureStamp){self.modifier_times.get(&serial).copied().unwrap_or((None,CaptureStamp::default()))}
  fn count_projection(&mut self,tick:i32,nodes:&projection::DenseNodes){let _method_span=crate::direct_method_profile::span(47);let start=FineInstant::now();let mut counts=[0u64;8];counts[0]=nodes.len()as u64;for node in nodes.values(){let index=match node.audience{0=>1,1=>2,3=>3,2 if node.observer==Some(2)=>4,2 if node.observer==Some(3)=>5,_=>6};counts[index]+=1;if node.audience==0&&node.kind=="player"{counts[7]+=1;}}self.projection_counts.push((tick,counts));self.profile.elapsed("projection.channel_count_receipt",start,nodes.len());}
  #[cfg(test)]
  fn position_policy(&mut self,time:Option<f64>,current:&mut BTreeMap<Scope,Node>){let _method_span=crate::direct_method_profile::span(48);
-  let gap=match(self.last_projection_time,time){(Some(old),Some(now))=>now-old>0.375,_=>false};
+  let eligible_elapsed=if self.e1_time_available{self.capture_now.elapsed_play_seconds}else{None};
+  let gap=match(self.last_projection_elapsed,eligible_elapsed){(Some(old),Some(now))=>now-old>0.375,_=>false};
   if gap{for anchor in self.positions.values_mut(){anchor.gap=true;}}
   if time.is_some(){self.last_projection_time=time;}
+  if eligible_elapsed.is_some(){self.last_projection_elapsed=eligible_elapsed;}
   let lives:HashMap<String,[Option<f64>;4]>=current.values().filter(|node|node.audience==0).map(|node|(node.key.clone(),["is_alive","lifestate","last_spawn_source_time","respawn_source_time"].map(|name|node.get(name)))).collect();
   let mut present=HashSet::new();
   for(scope,node)in current.iter_mut(){
@@ -318,25 +329,29 @@ impl Collector {
    let life=lives.get(&node.key).copied();
    let fresh=node.get("world_age")==Some(0.)&&node.get("visible")!=Some(0.);
    let observed=if fresh{time}else{node.position_observation_time.or(node.world_time)};
+   let observed_capture=if fresh{self.capture_now}else if node.capture_stamps[POSITION_OBSERVATION_CAPTURE].capture_tick.is_some(){node.capture_stamps[POSITION_OBSERVATION_CAPTURE]}else{node.capture_stamps[WORLD_CAPTURE]};
    let anchor=match self.positions.entry(scope.clone()){
-    std::collections::btree_map::Entry::Vacant(entry)=>entry.insert(PositionAnchor{point,life,id:node.id,emitted:observed,value_observed:observed,observed,gap:!fresh}),
+    std::collections::btree_map::Entry::Vacant(entry)=>entry.insert(PositionAnchor{emitted_capture:observed_capture,value_observed_capture:observed_capture,observed_capture,point,life,id:node.id,emitted:observed,value_observed:observed,observed,gap:!fresh}),
     std::collections::btree_map::Entry::Occupied(entry)=>{
      let anchor=entry.into_mut();let emit=anchor.life!=life||anchor.id!=node.id||anchor.gap||anchor.point.iter().zip(point).map(|(a,b)|(a-b)*(a-b)).sum::<f64>()>4.;
-     if fresh&&emit{*anchor=PositionAnchor{point,life,id:node.id,emitted:observed,value_observed:observed,observed,gap:false};}
-     else{if fresh{anchor.observed=observed;if point==anchor.point{anchor.value_observed=observed;}}anchor.gap=!fresh;}
+     if fresh&&emit{*anchor=PositionAnchor{emitted_capture:observed_capture,value_observed_capture:observed_capture,observed_capture,point,life,id:node.id,emitted:observed,value_observed:observed,observed,gap:false};}
+     else{if fresh{anchor.observed=observed;anchor.observed_capture=observed_capture;if point==anchor.point{anchor.value_observed=observed;anchor.value_observed_capture=observed_capture;}}anchor.gap=!fresh;}
      anchor
     }
    };
+   node.capture_stamps[WORLD_CAPTURE]=anchor.value_observed_capture;node.capture_stamps[POSITION_OBSERVATION_CAPTURE]=anchor.observed_capture;node.capture_stamps[POSITION_EMITTED_CAPTURE]=anchor.emitted_capture;
    node.xyz(Some(anchor.point));node.world_time=anchor.value_observed;node.position_observation_time=anchor.observed;node.position_observation_live=fresh;node.position_emitted_time=anchor.emitted;
-   node.set("world_age",if fresh&&anchor.value_observed==time{Some(0.)}else{None});
+   node.set("world_age",if fresh&&anchor.value_observed_capture==self.capture_now{Some(0.)}else{None});
    if fresh&&anchor.observed.is_some(){node.extras.insert("position-observation-age".into(),0.);}else{node.extras.remove("position-observation-age");}
   }
   self.positions.retain(|scope,_|present.contains(scope));
  }
  fn position_policy_dense(&mut self,time:Option<f64>,current:&mut projection::DenseNodes){let _method_span=crate::direct_method_profile::span(48);
-  let gap=match(self.last_projection_time,time){(Some(old),Some(now))=>now-old>0.375,_=>false};
+  let eligible_elapsed=if self.e1_time_available{self.capture_now.elapsed_play_seconds}else{None};
+  let gap=match(self.last_projection_elapsed,eligible_elapsed){(Some(old),Some(now))=>now-old>0.375,_=>false};
   if gap{for anchor in self.positions.values_mut(){anchor.gap=true;}}
   if time.is_some(){self.last_projection_time=time;}
+  if eligible_elapsed.is_some(){self.last_projection_elapsed=eligible_elapsed;}
   let lives:HashMap<String,[Option<f64>;4]>=current.values().filter(|node|node.audience==0).map(|node|(node.key.clone(),["is_alive","lifestate","last_spawn_source_time","respawn_source_time"].map(|name|node.get(name)))).collect();
   let mut present=HashSet::new();
   current.for_each_mut(|scope,node|{
@@ -346,17 +361,19 @@ impl Collector {
    let life=lives.get(&node.key).copied();
    let fresh=node.get("world_age")==Some(0.)&&node.get("visible")!=Some(0.);
    let observed=if fresh{time}else{node.position_observation_time.or(node.world_time)};
+   let observed_capture=if fresh{self.capture_now}else if node.capture_stamps[POSITION_OBSERVATION_CAPTURE].capture_tick.is_some(){node.capture_stamps[POSITION_OBSERVATION_CAPTURE]}else{node.capture_stamps[WORLD_CAPTURE]};
    let anchor=match self.positions.entry(scope.clone()){
-    std::collections::btree_map::Entry::Vacant(entry)=>entry.insert(PositionAnchor{point,life,id:node.id,emitted:observed,value_observed:observed,observed,gap:!fresh}),
+    std::collections::btree_map::Entry::Vacant(entry)=>entry.insert(PositionAnchor{emitted_capture:observed_capture,value_observed_capture:observed_capture,observed_capture,point,life,id:node.id,emitted:observed,value_observed:observed,observed,gap:!fresh}),
     std::collections::btree_map::Entry::Occupied(entry)=>{
      let anchor=entry.into_mut();let emit=anchor.life!=life||anchor.id!=node.id||anchor.gap||anchor.point.iter().zip(point).map(|(a,b)|(a-b)*(a-b)).sum::<f64>()>4.;
-     if fresh&&emit{*anchor=PositionAnchor{point,life,id:node.id,emitted:observed,value_observed:observed,observed,gap:false};}
-     else{if fresh{anchor.observed=observed;if point==anchor.point{anchor.value_observed=observed;}}anchor.gap=!fresh;}
+     if fresh&&emit{*anchor=PositionAnchor{emitted_capture:observed_capture,value_observed_capture:observed_capture,observed_capture,point,life,id:node.id,emitted:observed,value_observed:observed,observed,gap:false};}
+     else{if fresh{anchor.observed=observed;anchor.observed_capture=observed_capture;if point==anchor.point{anchor.value_observed=observed;anchor.value_observed_capture=observed_capture;}}anchor.gap=!fresh;}
      anchor
     }
    };
+   node.capture_stamps[WORLD_CAPTURE]=anchor.value_observed_capture;node.capture_stamps[POSITION_OBSERVATION_CAPTURE]=anchor.observed_capture;node.capture_stamps[POSITION_EMITTED_CAPTURE]=anchor.emitted_capture;
    node.xyz(Some(anchor.point));node.world_time=anchor.value_observed;node.position_observation_time=anchor.observed;node.position_observation_live=fresh;node.position_emitted_time=anchor.emitted;
-   node.set("world_age",if fresh&&anchor.value_observed==time{Some(0.)}else{None});
+   node.set("world_age",if fresh&&anchor.value_observed_capture==self.capture_now{Some(0.)}else{None});
    if fresh&&anchor.observed.is_some(){node.extras.insert("position-observation-age".into(),0.);}else{node.extras.remove("position-observation-age");}
   });
   self.positions.retain(|scope,_|present.contains(scope));
@@ -367,19 +384,19 @@ impl Collector {
   for(scope,node)in &mut current{
    let started=FineInstant::now();let copied=0.;let explicit_source=node.source_time;let modifier=node.class.as_deref().is_some_and(|c|c.starts_with("modifier:"));
    let changed=if let Some(old)=self.previous.get(scope).filter(|old|old.id==node.id&&old.owner==node.owner&&old.hero==node.hero&&old.team==node.team){
-    node.map_time=if node.get("map_age")==Some(0.){time}else{node.map_time.or(old.map_time)};
-    node.health_time=if node.get("health_age")==Some(0.){time}else{node.health_time.or(old.health_time)};
-    node.world_time=if node.get("world_age")==Some(0.){time}else{node.world_time.or(old.world_time)};
-    node.source_time=if modifier{explicit_source}else{explicit_source.or(old.source_time)};
+    if node.get("map_age")==Some(0.){node.capture_stamps[MAP_CAPTURE]=self.capture_now;}else if node.map_time.is_none()&&node.capture_stamps[MAP_CAPTURE].capture_tick.is_none(){node.capture_stamps[MAP_CAPTURE]=old.capture_stamps[MAP_CAPTURE];}node.map_time=if node.get("map_age")==Some(0.){time}else{node.map_time.or(old.map_time)};
+    if node.get("health_age")==Some(0.){node.capture_stamps[HEALTH_CAPTURE]=self.capture_now;}else if node.health_time.is_none()&&node.capture_stamps[HEALTH_CAPTURE].capture_tick.is_none(){node.capture_stamps[HEALTH_CAPTURE]=old.capture_stamps[HEALTH_CAPTURE];}node.health_time=if node.get("health_age")==Some(0.){time}else{node.health_time.or(old.health_time)};
+    if node.get("world_age")==Some(0.){node.capture_stamps[WORLD_CAPTURE]=self.capture_now;}else if node.world_time.is_none()&&node.capture_stamps[WORLD_CAPTURE].capture_tick.is_none(){node.capture_stamps[WORLD_CAPTURE]=old.capture_stamps[WORLD_CAPTURE];}node.world_time=if node.get("world_age")==Some(0.){time}else{node.world_time.or(old.world_time)};
+    if !modifier&&explicit_source.is_none(){node.capture_stamps[SOURCE_CAPTURE]=old.capture_stamps[SOURCE_CAPTURE];}node.source_time=if modifier{explicit_source}else{explicit_source.or(old.source_time)};
     !node.same_observation_content(old)
-   }else{node.source_time=if modifier{explicit_source}else{explicit_source.or(time)};if node.get("map_age")==Some(0.){node.map_time=time};if node.get("health_age")==Some(0.){node.health_time=time};if node.get("world_age")==Some(0.){node.world_time=time};true};
-   if changed{node.source_time=if modifier{explicit_source}else{explicit_source.or(time)};}
+   }else{node.source_time=if modifier{explicit_source}else{explicit_source.or(time)};if node.get("map_age")==Some(0.){node.map_time=time;node.capture_stamps[MAP_CAPTURE]=self.capture_now;};if node.get("health_age")==Some(0.){node.health_time=time;node.capture_stamps[HEALTH_CAPTURE]=self.capture_now;};if node.get("world_age")==Some(0.){node.world_time=time;node.capture_stamps[WORLD_CAPTURE]=self.capture_now;};true};
+   if changed{node.source_time=if modifier{explicit_source}else{explicit_source.or(time)};if !modifier&&explicit_source.is_none(){node.capture_stamps[SOURCE_CAPTURE]=self.capture_now;}}
    self.profile.add("append.comparison",started.elapsed().as_secs_f64()-copied,1);
    if copied>0.{self.profile.add("append.comparable_copy",copied,1);}
-   if changed{let copy=FineInstant::now();self.rows.push((tick,time,node.clone()));self.profile.elapsed("append.output_copy",copy,1);}
+   if changed{let copy=FineInstant::now();node.emission_clock=self.capture_now;node.e1_time_available=self.e1_time_available;self.rows.push((tick,time,node.clone()));self.profile.elapsed("append.output_copy",copy,1);}
   }
   let _lifecycle_method=crate::direct_method_profile::span(86);let copy=FineInstant::now();let before=self.rows.len();
-  for(scope,mut n)in std::mem::take(&mut self.previous){if !current.contains_key(&scope){n.active=false;n.values=[None;66];n.extras.clear();n.relations.clear();n.source_time=time;self.rows.push((tick,time,n));}}
+  for(scope,mut n)in std::mem::take(&mut self.previous){if !current.contains_key(&scope){n.active=false;n.values=[None;66];n.extras.clear();n.relations.clear();n.source_time=time;n.capture_stamps[SOURCE_CAPTURE]=self.capture_now;n.emission_clock=self.capture_now;n.e1_time_available=self.e1_time_available;self.rows.push((tick,time,n));}}
   self.previous=current;self.profile.elapsed("append.lifecycle_and_replacement",copy,self.rows.len()-before);
  }
  // Runtime path: persistent raw projection and normalized previous records.
@@ -393,25 +410,26 @@ impl Collector {
    let started=FineInstant::now();let explicit_source=node.source_time;let modifier=node.class.as_deref().is_some_and(|c|c.starts_with("modifier:"));
    let old=self.history.get_id_mut(id);
    let changed=if let Some(old)=old.as_deref().filter(|old|old.id==node.id&&old.owner==node.owner&&old.hero==node.hero&&old.team==node.team){
-    node.map_time=if node.get("map_age")==Some(0.){time}else{node.map_time.or(old.map_time)};
-    node.health_time=if node.get("health_age")==Some(0.){time}else{node.health_time.or(old.health_time)};
-    node.world_time=if node.get("world_age")==Some(0.){time}else{node.world_time.or(old.world_time)};
-    node.source_time=if modifier{explicit_source}else{explicit_source.or(old.source_time)};
+    if node.get("map_age")==Some(0.){node.capture_stamps[MAP_CAPTURE]=self.capture_now;}else if node.map_time.is_none()&&node.capture_stamps[MAP_CAPTURE].capture_tick.is_none(){node.capture_stamps[MAP_CAPTURE]=old.capture_stamps[MAP_CAPTURE];}node.map_time=if node.get("map_age")==Some(0.){time}else{node.map_time.or(old.map_time)};
+    if node.get("health_age")==Some(0.){node.capture_stamps[HEALTH_CAPTURE]=self.capture_now;}else if node.health_time.is_none()&&node.capture_stamps[HEALTH_CAPTURE].capture_tick.is_none(){node.capture_stamps[HEALTH_CAPTURE]=old.capture_stamps[HEALTH_CAPTURE];}node.health_time=if node.get("health_age")==Some(0.){time}else{node.health_time.or(old.health_time)};
+    if node.get("world_age")==Some(0.){node.capture_stamps[WORLD_CAPTURE]=self.capture_now;}else if node.world_time.is_none()&&node.capture_stamps[WORLD_CAPTURE].capture_tick.is_none(){node.capture_stamps[WORLD_CAPTURE]=old.capture_stamps[WORLD_CAPTURE];}node.world_time=if node.get("world_age")==Some(0.){time}else{node.world_time.or(old.world_time)};
+    if !modifier&&explicit_source.is_none(){node.capture_stamps[SOURCE_CAPTURE]=old.capture_stamps[SOURCE_CAPTURE];}node.source_time=if modifier{explicit_source}else{explicit_source.or(old.source_time)};
     !node.same_observation_content(old)
-   }else{node.source_time=if modifier{explicit_source}else{explicit_source.or(time)};if node.get("map_age")==Some(0.){node.map_time=time};if node.get("health_age")==Some(0.){node.health_time=time};if node.get("world_age")==Some(0.){node.world_time=time};true};
+   }else{node.source_time=if modifier{explicit_source}else{explicit_source.or(time)};if node.get("map_age")==Some(0.){node.map_time=time;node.capture_stamps[MAP_CAPTURE]=self.capture_now;};if node.get("health_age")==Some(0.){node.health_time=time;node.capture_stamps[HEALTH_CAPTURE]=self.capture_now;};if node.get("world_age")==Some(0.){node.world_time=time;node.capture_stamps[WORLD_CAPTURE]=self.capture_now;};true};
    self.profile.elapsed("append.comparison",started,1);
    if changed{
     node.source_time=if modifier{explicit_source}else{explicit_source.or(time)};
-    let copy=FineInstant::now();self.rows.push((tick,time,node.clone()));self.profile.elapsed("append.output_copy",copy,1);
+    if !modifier&&explicit_source.is_none(){node.capture_stamps[SOURCE_CAPTURE]=self.capture_now;}
+    let copy=FineInstant::now();node.emission_clock=self.capture_now;node.e1_time_available=self.e1_time_available;self.rows.push((tick,time,node.clone()));self.profile.elapsed("append.output_copy",copy,1);
     if let Some(old)=old{*old=node.clone();}else{self.history.insert_at(id,scope.clone(),node.clone());}
    }else if let Some(old)=old{// Equality intentionally treats signed zeros as equal, but the original
     // whole-map replacement retained the latest bits for later remembered rows.
     old.values=node.values;old.extras=node.extras.clone();
-    old.source_time=node.source_time;old.map_time=node.map_time;old.health_time=node.health_time;old.world_time=node.world_time;old.position_observation_time=node.position_observation_time;old.position_emitted_time=node.position_emitted_time;}
+    old.capture_stamps=node.capture_stamps;old.source_time=node.source_time;old.map_time=node.map_time;old.health_time=node.health_time;old.world_time=node.world_time;old.position_observation_time=node.position_observation_time;old.position_emitted_time=node.position_emitted_time;}
   });
   let _lifecycle_method=crate::direct_method_profile::span(86);let started=FineInstant::now();let before=self.rows.len();let removed:Vec<_>=self.history.scope_ids().filter(|&(_,id)|current.get_id(id).is_none()).map(|(scope,_)|scope.clone()).collect();
   for scope in removed{let node=self.history.remove(&scope).unwrap();self.retired_history.insert(scope,node);}
-  for(_,mut node)in std::mem::take(&mut self.retired_history){node.active=false;node.values=[None;66];node.extras.clear();node.relations.clear();node.source_time=time;self.rows.push((tick,time,node));}
+  for(_,mut node)in std::mem::take(&mut self.retired_history){node.active=false;node.values=[None;66];node.extras.clear();node.relations.clear();node.source_time=time;node.capture_stamps[SOURCE_CAPTURE]=self.capture_now;node.emission_clock=self.capture_now;node.e1_time_available=self.e1_time_available;self.rows.push((tick,time,node));}
   self.profile.elapsed("append.lifecycle_and_replacement",started,self.rows.len()-before);
   {let mut saved=restore.drain(..);current.for_each_mut(|_,node|saved.next().expect("raw restoration count").restore(node));assert!(saved.next().is_none(),"raw restoration count");}
   self.projection_restore=restore;self.projection_cache.output=current;
@@ -420,7 +438,22 @@ impl Collector {
   let mut count_cols=vec![Column::new("tick".into(),self.projection_counts.iter().map(|r|r.0).collect::<Vec<_>>())];
   for(index,name)in ["total_nodes","public_nodes","owner_nodes","team_private_nodes","observer_team2_nodes","observer_team3_nodes","other_scope_nodes","public_player_nodes"].iter().enumerate(){count_cols.push(Column::new((*name).into(),self.projection_counts.iter().map(|r|r.1[index]).collect::<Vec<_>>()));}
   let count_frame=df_from_columns(count_cols)?;let(updates,extras,relations)=self.rows.frames()?;
-  Ok(vec![("clock",df_from_columns(vec![Column::new("tick".into(),self.clock_ticks),Column::new("is_sample".into(),self.clock_samples),Column::new("is_postgame".into(),self.clock_terminal),Column::new("match_seconds".into(),self.clock_seconds),Column::new("clock_observed_tick".into(),self.clock_observed_ticks)])?),("entity_updates",updates),("extras",extras),("relations",relations),("projection_counts",count_frame)])
+  let evidence=&self.clock_evidence;
+  let mut clock_cols=vec![Column::new("tick".into(),self.clock_ticks),Column::new("is_sample".into(),self.clock_samples),Column::new("is_postgame".into(),self.clock_terminal),Column::new("match_seconds".into(),self.clock_seconds),Column::new("clock_observed_tick".into(),self.clock_observed_ticks)];
+  clock_cols.extend([
+   Column::new("elapsed_play_seconds".into(),evidence.iter().map(|e|e.elapsed_play_seconds).collect::<Vec<_>>()),
+   Column::new("elapsed_play_known".into(),evidence.iter().map(|e|e.elapsed_play_seconds.is_some()).collect::<Vec<_>>()),
+   Column::new("timing_segment_id".into(),evidence.iter().map(|e|e.timing_segment_id).collect::<Vec<_>>()),
+   Column::new("e1_time_available".into(),evidence.iter().map(|e|e.e1_time_available).collect::<Vec<_>>()),
+   Column::new("controller_tick_base".into(),evidence.iter().map(|e|e.input.controller_tick_base).collect::<Vec<_>>()),
+   Column::new("total_paused_ticks".into(),evidence.iter().map(|e|e.input.total_paused_ticks).collect::<Vec<_>>()),
+   Column::new("tick_interval_seconds".into(),evidence.iter().map(|e|e.input.tick_interval_seconds).collect::<Vec<_>>()),
+   Column::new("raw_match_clock_at_last_update".into(),evidence.iter().map(|e|e.input.raw_match_clock_at_last_update).collect::<Vec<_>>()),
+   Column::new("raw_match_clock_update_tick".into(),evidence.iter().map(|e|e.input.raw_match_clock_update_tick).collect::<Vec<_>>()),
+   Column::new("game_paused".into(),evidence.iter().map(|e|e.input.game_paused).collect::<Vec<_>>()),
+   Column::new("server_paused".into(),evidence.iter().map(|e|e.input.server_paused).collect::<Vec<_>>())]);
+  let clock_frame=df_from_columns(clock_cols)?;
+  Ok(vec![("clock",clock_frame),("entity_updates",updates),("extras",extras),("relations",relations),("projection_counts",count_frame)])
  }
 
 }
@@ -480,9 +513,14 @@ impl Demo {
  /// Only requested completed source ticks are admitted. Repeated states are
  /// change-compressed. Supply a carry-in sample before the window start.
  /// Match seconds are the CURRENT replicated HUD clock; never future game-over.
- #[pyo3(signature=(*,ticks,entity_classes=None,method_profile=false))]
- pub(crate) fn direct_model_columns(&self,py:Python<'_>,ticks:Vec<i32>,entity_classes:Option<HashMap<i64,String>>,method_profile:bool)->PyResult<Py<PyDict>>{
-  collect_model_columns(py,ticks,entity_classes,method_profile,StandaloneModelSource(&self.parser))
+ /// selected_tick_progress(visited, total, phase) reports unique requested completed
+ /// source ticks, including postgame ticks, independently of projected rows.
+ /// It emits an initial count, throttled observations, and actual EOF count;
+ /// phase is "decode" for counts and "finalize" before unestimated dataframe
+ /// construction (also for an empty plan). Callback errors abort parsing.
+ #[pyo3(signature=(*,ticks,entity_classes=None,method_profile=false,selected_tick_progress=None))]
+ pub(crate) fn direct_model_columns(&self,py:Python<'_>,ticks:Vec<i32>,entity_classes:Option<HashMap<i64,String>>,method_profile:bool,selected_tick_progress:Option<Py<PyAny>>)->PyResult<Py<PyDict>>{
+  collect_model_columns(py,ticks,entity_classes,method_profile,selected_tick_progress,StandaloneModelSource(&self.parser))
  }
 }
 
@@ -502,14 +540,19 @@ impl ModelSourcePass for StandaloneModelSource<'_> {
   self.0.try_run_to_end_with_event_types_filtered(classes,events,visit).map_err(to_py_err)?;Ok(0.)
  }
 }
-pub(super) fn collect_model_columns<S:ModelSourcePass>(py:Python<'_>,ticks:Vec<i32>,entity_classes:Option<HashMap<i64,String>>,method_profile:bool,mut source:S)->PyResult<Py<PyDict>>{
+pub(super) fn collect_model_columns<S:ModelSourcePass>(py:Python<'_>,ticks:Vec<i32>,entity_classes:Option<HashMap<i64,String>>,method_profile:bool,selected_tick_progress:Option<Py<PyAny>>,mut source:S)->PyResult<Py<PyDict>>{
   if method_profile&&!crate::direct_method_profile::AVAILABLE{return Err(pyo3::exceptions::PyValueError::new_err("method profiling requires an artifact built with direct-method-profile"))}
 
   let frames=py.detach(|| -> PyResult<Vec<(&'static str,DataFrame)>> {
    let method_session=crate::direct_method_profile::Session::begin(method_profile);
    let result=(|| -> PyResult<Vec<(&'static str,DataFrame)>> {let _method_span=crate::direct_method_profile::span(54);
    let _field_keys=FieldKeyScope::enter();
-   let selected:HashSet<i32>=ticks.into_iter().collect();let mut out=Collector::default();let mut diagnostics=Diagnostics::default();if selected.is_empty(){source.collect_without_model()?;let mut frames=out.frames().map_err(|e|InvalidDemoError::new_err(e.to_string()))?;frames.push(("player_bindings",Bindings::default().frame().map_err(|e|InvalidDemoError::new_err(e.to_string()))?));frames.push(("breakable_messages",crate::direct_breakable_messages::DebrisColumns::default().frame().map_err(|e|InvalidDemoError::new_err(e.to_string()))?));frames.push(("ability_usage",ability_transitions::AbilityTransitions::default().frame().map_err(|e|InvalidDemoError::new_err(e.to_string()))?));#[cfg(feature="direct-method-profile")]frames.push(("profile",Profile::default().frame().map_err(|e|InvalidDemoError::new_err(e.to_string()))?));frames.push(("diagnostics",diagnostics.frame().map_err(|e|InvalidDemoError::new_err(e.to_string()))?));return Ok(frames);}
+   let selected:HashSet<i32>=ticks.into_iter().collect();
+   let mut selected_progress=selected_tick_progress.as_ref().map(|_|crate::selected_tick_progress::SelectedTickProgress::new(&selected,Instant::now()));
+   if let (Some(callback),Some(progress))=(&selected_tick_progress,&selected_progress){crate::selected_tick_callback::emit(callback,progress.snapshot(),"decode")?;}
+   let mut out=Collector::default();let mut diagnostics=Diagnostics::default();if selected.is_empty(){source.collect_without_model()?;
+   if let Some(callback)=&selected_tick_progress{crate::selected_tick_callback::emit(callback,(0,0),"finalize")?;}
+   let mut frames=out.frames().map_err(|e|InvalidDemoError::new_err(e.to_string()))?;frames.push(("player_bindings",Bindings::default().frame().map_err(|e|InvalidDemoError::new_err(e.to_string()))?));frames.push(("breakable_messages",crate::direct_breakable_messages::DebrisColumns::default().frame().map_err(|e|InvalidDemoError::new_err(e.to_string()))?));frames.push(("ability_usage",ability_transitions::AbilityTransitions::default().frame().map_err(|e|InvalidDemoError::new_err(e.to_string()))?));#[cfg(feature="direct-method-profile")]frames.push(("profile",Profile::default().frame().map_err(|e|InvalidDemoError::new_err(e.to_string()))?));frames.push(("diagnostics",diagnostics.frame().map_err(|e|InvalidDemoError::new_err(e.to_string()))?));return Ok(frames);}
    let classes=entity_classes.unwrap_or_default();let mut error=None;let mut check=std::time::Instant::now();
    let initial=FineInstant::now();let init={let _span=crate::direct_method_profile::span(80);source.initialize().map_err(to_py_err)?};#[cfg(any(feature="direct-method-profile",test))]{out.profile.elapsed("parser.initial_parse",initial,1);};let plan=FineInstant::now();
    let class_plan_span=crate::direct_method_profile::span(85);let names:Vec<String>=init.serializers().iter().filter(|(name,s)|kind(name)!="unknown"||name.contains("Ability")||name.contains("Item")||{let _span=crate::direct_method_profile::span(87);s.resolve_field_key("m_flAmmoFrac")}.is_some()||matches!(name.as_ref(),"CCitadelPlayerController"|"CCitadelTeam"|"CCitadelGameRulesProxy")).map(|(name,_)|name.to_string()).collect();
@@ -547,13 +590,31 @@ pub(super) fn collect_model_columns<S:ModelSourcePass>(py:Python<'_>,ticks:Vec<i
       },_=>None
      }
     }else{None};
+    let proof_rule=(rules.len()==1).then(||rules[0]);
+    let proof_base=class_candidates(ctx,"CCitadelPlayerController").into_iter().filter(|e|e.active)
+     .filter(|e|["m_hPawn","m_hHeroPawn"].iter().any(|name|resolved(ctx,e,name).is_some_and(|p|p.active&&p.class_name.as_ref()=="CCitadelPlayerPawn")))
+     .filter_map(|e|i(ctx,e,"m_nTickBase")).max();
+    let proof=out.elapsed_clock.observe(elapsed_play_clock::Input{tick:ctx.tick(),raw_match_seconds:time,controller_tick_base:proof_base,
+     total_paused_ticks:proof_rule.and_then(|r|i(ctx,r,"m_pGameRules.m_nTotalPausedTicks")),tick_interval_seconds:f64::from(ctx.tick_interval()),
+     raw_match_clock_at_last_update:proof_rule.and_then(|r|n(ctx,r,"m_pGameRules.m_flMatchClockAtLastUpdate")),
+     raw_match_clock_update_tick:proof_rule.and_then(|r|i(ctx,r,"m_pGameRules.m_nMatchClockUpdateTick")),
+     game_paused:proof_rule.and_then(|r|b(ctx,r,"m_pGameRules.m_bGamePaused")),server_paused:proof_rule.and_then(|r|b(ctx,r,"m_pGameRules.m_bServerPaused"))})
+     .map_err(|context|boon_parser::Error::Parse{context:format!("elapsed-play timing policy at source tick {}: {context}",ctx.tick())})?;
+    out.capture_now=proof.capture();out.e1_time_available=proof.e1_time_available;out.clock_evidence.push(proof);
     let elapsed=stage.elapsed().as_secs_f64();drop(clock_method);diagnostics.clock_seconds+=elapsed;#[cfg(any(feature="direct-method-profile",test))]{out.profile.add("integration.source_clock",elapsed,1);};let stage=FineInstant::now();let before=usage.len();usage.collect(ctx,time,&bindings,ended);let elapsed=stage.elapsed().as_secs_f64();diagnostics.usage_seconds+=elapsed;#[cfg(any(feature="direct-method-profile",test))]{out.profile.add("integration.ability_transitions",elapsed,usage.len()-before);};
-    for change in modifier_changes{out.projection_cache.modifier_changed(change.serial);if change.kind==boon_parser::ModifierChangeKind::Removed{out.modifier_times.remove(&change.serial);}else{out.modifier_times.insert(change.serial,time);}}
+    for change in modifier_changes{out.capture_modifier_change(change.serial,change.kind,time);}
     let sample=selected.contains(&ctx.tick());out.clock_ticks.push(ctx.tick());out.clock_samples.push(sample);out.clock_terminal.push(ended);out.clock_seconds.push(time);out.clock_observed_ticks.push(time.and(out.last_clock.map(|v|v.1)));
     if sample&&!ended{diagnostics.selected_ticks+=1;let stage=FineInstant::now();let nodes=out.project(ctx,time,&classes,&mut model_entities);out.count_projection(ctx.tick(),&nodes);out.append_projected(ctx.tick(),time,nodes);diagnostics.projection_seconds+=stage.elapsed().as_secs_f64();}
     #[cfg(feature="direct-method-profile")]if progress&&diagnostics.source_ticks%10_000==0{let(cpu,rss)=process_usage();let scan_cpu=cpu.zip(scan_cpu_start).map(|(now,start)|now-start);eprintln!("boon_direct tick={} elapsed={:.3}s selected={} state_rows={} projection={:.3}s usage={:.3}s scan_cpu_seconds={:?} process_cpu_seconds={:?} process_peak_rss_kib={:?}",ctx.tick(),scan_start.elapsed().as_secs_f64(),diagnostics.selected_ticks,out.rows.len(),diagnostics.projection_seconds,diagnostics.usage_seconds,scan_cpu,cpu,rss);}
+    if sample{if let Some(progress)=selected_progress.as_mut(){if progress.observe(ctx.tick(),Instant::now()){
+     if let Some(callback)=&selected_tick_progress{if let Err(e)=crate::selected_tick_callback::emit(callback,progress.snapshot(),"decode"){error=Some(e);return Err(crate::bounded_spool::aborted())}}
+    }}}
     diagnostics.callback_seconds+=callback.elapsed().as_secs_f64();Ok(())
    }).map_err(|e|error.take().unwrap_or(e))?;
+   // Final observed count precedes unestimated dataframe finalization. Never
+   // substitute the plan total at EOF: requested ticks may be absent.
+   if let (Some(callback),Some(progress))=(&selected_tick_progress,&selected_progress){crate::selected_tick_callback::emit(callback,progress.snapshot(),"decode")?;}
+   if let (Some(callback),Some(progress))=(&selected_tick_progress,&selected_progress){crate::selected_tick_callback::emit(callback,progress.snapshot(),"finalize")?;}
    drop(scan_method);diagnostics.scan_seconds=scan_start.elapsed().as_secs_f64();#[cfg(feature="direct-method-profile")]{diagnostics.scan_cpu_seconds=process_usage().0.zip(scan_cpu_start).map(|(now,start)|now-start);}let mut profile=std::mem::take(&mut out.profile);let frame_rows=out.rows.len();let stage=FineInstant::now();let mut frames=out.frames().map_err(|e|InvalidDemoError::new_err(e.to_string()))?;frames.push(("breakable_messages",debris.frame().map_err(|e|InvalidDemoError::new_err(e.to_string()))?));frames.push(("player_bindings",bindings.frame().map_err(|e|InvalidDemoError::new_err(e.to_string()))?));frames.push(("ability_usage",usage.frame().map_err(|e|InvalidDemoError::new_err(e.to_string()))?));diagnostics.frames_seconds=stage.elapsed().as_secs_f64();
    #[cfg(any(feature="direct-method-profile",test))]let projection_detail=profile.sum_prefix("projection.")+profile.sum_prefix("append.");
    #[cfg(any(feature="direct-method-profile",test))]{profile.summary("integration.projection_unresolved",diagnostics.projection_seconds-projection_detail,diagnostics.selected_ticks,diagnostics.selected_ticks);};
@@ -767,19 +828,20 @@ mod tests {
 #[cfg(test)]
 mod position_tests {
  use super::*;
+ fn append(c:&mut Collector,tick:i32,time:Option<f64>,nodes:BTreeMap<Scope,Node>){c.capture_now=CaptureStamp{capture_tick:Some(i64::from(tick)),timing_segment_id:Some(0),elapsed_play_seconds:time};c.e1_time_available=time.is_some();c.append(tick,time,nodes);}
  #[test]
  fn strict_two_unit_anchor_separates_value_age_and_observation_age(){
   let mut c=Collector::default();let mut node=Node::new("player:1".into(),"player",1);node.id=Some((1,2));node.xyz(Some([0.,0.,0.]));
-  c.append(1,Some(0.),[(node.scope(),node.clone())].into_iter().collect());
-  node.xyz(Some([1.,0.,0.]));c.append(17,Some(0.25),[(node.scope(),node.clone())].into_iter().collect());
+  append(&mut c,1,Some(0.),[(node.scope(),node.clone())].into_iter().collect());
+  node.xyz(Some([1.,0.,0.]));append(&mut c,17,Some(0.25),[(node.scope(),node.clone())].into_iter().collect());
   assert_eq!(c.rows.len(),2);assert_eq!(c.rows[1].2.get("world_x"),Some(0.));assert_eq!(c.rows[1].2.get("world_age"),None);assert_eq!(c.rows[1].2.world_time,Some(0.));assert_eq!(c.rows[1].2.position_observation_time,Some(0.25));assert!(c.rows[1].2.position_observation_live);
-  node.xyz(Some([2.,0.,0.]));c.append(33,Some(0.5),[(node.scope(),node.clone())].into_iter().collect());assert_eq!(c.rows.len(),2);
-  node.xyz(Some([2.01,0.,0.]));c.append(49,Some(0.75),[(node.scope(),node.clone())].into_iter().collect());assert_eq!(c.rows.len(),3);assert_eq!(c.rows[2].2.get("world_x"),Some(2.01));assert_eq!(c.rows[2].2.get("world_age"),Some(0.));
-  c.append(65,Some(1.),[(node.scope(),node.clone())].into_iter().collect());assert_eq!(c.rows.len(),3);assert_eq!(c.previous[&node.scope()].world_time,Some(1.));
+  node.xyz(Some([2.,0.,0.]));append(&mut c,33,Some(0.5),[(node.scope(),node.clone())].into_iter().collect());assert_eq!(c.rows.len(),2);
+  node.xyz(Some([2.01,0.,0.]));append(&mut c,49,Some(0.75),[(node.scope(),node.clone())].into_iter().collect());assert_eq!(c.rows.len(),3);assert_eq!(c.rows[2].2.get("world_x"),Some(2.01));assert_eq!(c.rows[2].2.get("world_age"),Some(0.));
+  append(&mut c,65,Some(1.),[(node.scope(),node.clone())].into_iter().collect());assert_eq!(c.rows.len(),3);assert_eq!(c.previous[&node.scope()].world_time,Some(1.));
  }
  #[test]
  fn qualified_coverage_gap_forces_new_anchor_without_future_information(){
-  let mut c=Collector::default();let mut node=Node::new("entity:1".into(),"guardian",0);node.xyz(Some([0.,0.,0.]));c.append(1,Some(0.),[(node.scope(),node.clone())].into_iter().collect());node.xyz(Some([1.,0.,0.]));c.append(64,Some(1.),[(node.scope(),node)].into_iter().collect());assert_eq!(c.rows[1].2.get("world_x"),Some(1.));
+  let mut c=Collector::default();let mut node=Node::new("entity:1".into(),"guardian",0);node.xyz(Some([0.,0.,0.]));append(&mut c,1,Some(0.),[(node.scope(),node.clone())].into_iter().collect());node.xyz(Some([1.,0.,0.]));append(&mut c,64,Some(1.),[(node.scope(),node)].into_iter().collect());assert_eq!(c.rows[1].2.get("world_x"),Some(1.));
  }
 }
 
@@ -797,7 +859,7 @@ mod production_api_tests {
  fn empty_source_keeps_functional_tables_without_profiling_tables(){
   Python::initialize();Python::attach(|py|{
    let calls=Arc::new(AtomicUsize::new(0));
-   let result=collect_model_columns(py,vec![],None,false,EmptySource(calls.clone())).unwrap();
+   let result=collect_model_columns(py,vec![],None,false,None,EmptySource(calls.clone())).unwrap();
    let tables=result.bind(py);
    for name in ["clock","entity_updates","extras","relations","projection_counts","player_bindings","breakable_messages","ability_usage","diagnostics"]{assert!(tables.contains(name).unwrap(),"missing functional table {name}");}
    for name in ["profile","method_profile","method_inventory","method_profile_diagnostics"]{assert!(!tables.contains(name).unwrap(),"unexpected profiling table {name}");}
@@ -813,11 +875,119 @@ mod production_api_tests {
   Python::initialize();Python::attach(|py|{
    let calls=Arc::new(AtomicUsize::new(0));
    for ticks in [vec![],vec![1]]{
-    let error=collect_model_columns(py,ticks,None,true,EmptySource(calls.clone())).unwrap_err();
+    let error=collect_model_columns(py,ticks,None,true,None,EmptySource(calls.clone())).unwrap_err();
     assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(py));
     assert!(error.to_string().contains("requires an artifact built with direct-method-profile"));
    }
    assert_eq!(calls.load(Ordering::SeqCst),0);
   });
+ }
+}
+
+#[cfg(test)]mod timing_capture_tests {
+ use super::*;
+ fn stamp(tick:i64,elapsed:Option<f64>,segment:u64)->CaptureStamp{CaptureStamp{capture_tick:Some(tick),timing_segment_id:Some(segment),elapsed_play_seconds:elapsed}}
+ fn clock(c:&mut Collector,tick:i64,elapsed:Option<f64>,segment:u64){c.capture_now=stamp(tick,elapsed,segment);c.e1_time_available=elapsed.is_some();}
+ #[test]fn unknown_health_origin_carries_without_future_backfill_in_runtime(){
+  let mut c=Collector::default();clock(&mut c,10,None,0);let mut first=Node::new("health".into(),"test",0);first.set("health",Some(9.));first.set("health_age",Some(0.));
+  let nodes=c.projection_cache.project_test_nodes([first.clone()]);c.append_projected(10,None,nodes);
+  assert_eq!(c.rows[0].2.capture_stamps[HEALTH_CAPTURE],stamp(10,None,0));
+  clock(&mut c,20,Some(7.),1);first.set("health_age",None);first.set("gold_net_worth",Some(1.));
+  let nodes=c.projection_cache.project_test_nodes([first]);c.append_projected(20,Some(-9.),nodes);
+  let row=&c.rows.last().unwrap().2;assert_eq!(row.capture_stamps[HEALTH_CAPTURE],stamp(10,None,0));assert_eq!(row.health_time,None);assert_eq!(row.emission_clock,stamp(20,Some(7.),1));
+ }
+ #[test]fn position_three_origins_remain_distinct_and_raw_projection_restores(){
+  let mut c=Collector::default();let mut node=Node::new("point".into(),"test",0);node.xyz(Some([0.,0.,0.]));clock(&mut c,1,Some(10.),0);
+  let nodes=c.projection_cache.project_test_nodes([node.clone()]);c.append_projected(1,Some(10.),nodes);
+  node.xyz(Some([1.,0.,0.]));clock(&mut c,2,Some(10.25),0);let nodes=c.projection_cache.project_test_nodes([node]);c.append_projected(2,Some(-100.),nodes);
+  let row=&c.rows.last().unwrap().2;assert_eq!(row.capture_stamps[WORLD_CAPTURE],stamp(1,Some(10.),0));assert_eq!(row.capture_stamps[POSITION_OBSERVATION_CAPTURE],stamp(2,Some(10.25),0));assert_eq!(row.capture_stamps[POSITION_EMITTED_CAPTURE],stamp(1,Some(10.),0));
+  let raw=c.projection_cache.output.values().next().unwrap();assert_eq!(raw.capture_stamps,[CaptureStamp::default();6]);assert_eq!(raw.emission_clock,CaptureStamp::default());assert!(!raw.e1_time_available);assert_eq!(raw.get("world_x"),Some(1.));
+ }
+ #[test]fn modifier_historical_stamp_survives_later_segment(){
+  let mut c=Collector::default();clock(&mut c,15,Some(2.),1);
+  // An unsampled apply observed before the first later selected projection.
+  clock(&mut c,5,None,0);c.capture_modifier_change(4,boon_parser::ModifierChangeKind::Applied,None);
+  clock(&mut c,15,Some(2.),1);let saved=c.modifier_origin(4);assert_eq!(saved.1,stamp(5,None,0));assert_eq!(saved.0,None);
+  c.capture_modifier_change(4,boon_parser::ModifierChangeKind::Removed,Some(2.));assert_eq!(c.modifier_origin(4),(None,CaptureStamp::default()));
+ }
+ #[test]fn raw_restore_restores_stamps_and_engine_authored_clocks_unchanged(){
+  let mut n=Node::new("raw".into(),"test",0);n.capture_stamps[MAP_CAPTURE]=stamp(3,None,0);n.set("respawn_source_time",Some(-42.));n.extras.insert("modifier-creation-source-clock".into(),-17.);
+  let saved=RawObservation::save(&n);n.capture_stamps=[stamp(99,Some(50.),2);6];saved.restore(&mut n);
+  assert_eq!(n.capture_stamps[MAP_CAPTURE],stamp(3,None,0));assert_eq!(n.get("respawn_source_time"),Some(-42.));assert_eq!(n.extras["modifier-creation-source-clock"],-17.);
+ }
+ #[test]fn additive_capture_columns_preserve_unknown_observation_identity(){
+  let mut rows=rows::EmittedRows::default();let mut n=Node::new("u".into(),"test",0);n.capture_stamps[MAP_CAPTURE]=stamp(7,None,2);n.emission_clock=stamp(8,Some(1.),2);n.e1_time_available=true;rows.push((8,Some(-3.),n));let(updates,_,_)=rows.frames().unwrap();
+  assert_eq!(updates.column("match_seconds").unwrap().f64().unwrap().get(0),Some(-3.));assert_eq!(updates.column("map_capture_tick").unwrap().i64().unwrap().get(0),Some(7));assert_eq!(updates.column("map_elapsed_play_seconds").unwrap().f64().unwrap().get(0),None);assert_eq!(updates.column("map_elapsed_play_known").unwrap().bool().unwrap().get(0),Some(false));assert_eq!(updates.column("elapsed_play_seconds").unwrap().f64().unwrap().get(0),Some(1.));
+ }
+}
+
+#[cfg(test)]impl Collector {
+ fn legacy_position_policy_timing_oracle(&mut self,time:Option<f64>,current:&mut BTreeMap<Scope,Node>){let _method_span=crate::direct_method_profile::span(48);
+  let gap=match(self.last_projection_time,time){(Some(old),Some(now))=>now-old>0.375,_=>false};
+  if gap{for anchor in self.positions.values_mut(){anchor.gap=true;}}
+  if time.is_some(){self.last_projection_time=time;}
+  let lives:HashMap<String,[Option<f64>;4]>=current.values().filter(|node|node.audience==0).map(|node|(node.key.clone(),["is_alive","lifestate","last_spawn_source_time","respawn_source_time"].map(|name|node.get(name)))).collect();
+  let mut present=HashSet::new();
+  for(scope,node)in current.iter_mut(){
+   let values=[node.get("world_x"),node.get("world_y"),node.get("world_z")];
+   if !values.iter().all(Option::is_some){self.positions.remove(scope);continue}
+   let point=values.map(Option::unwrap);present.insert(scope.clone());
+   let life=lives.get(&node.key).copied();
+   let fresh=node.get("world_age")==Some(0.)&&node.get("visible")!=Some(0.);
+   let observed=if fresh{time}else{node.position_observation_time.or(node.world_time)};
+   let anchor=match self.positions.entry(scope.clone()){
+    std::collections::btree_map::Entry::Vacant(entry)=>entry.insert(PositionAnchor{emitted_capture:CaptureStamp::default(),value_observed_capture:CaptureStamp::default(),observed_capture:CaptureStamp::default(),point,life,id:node.id,emitted:observed,value_observed:observed,observed,gap:!fresh}),
+    std::collections::btree_map::Entry::Occupied(entry)=>{
+     let anchor=entry.into_mut();let emit=anchor.life!=life||anchor.id!=node.id||anchor.gap||anchor.point.iter().zip(point).map(|(a,b)|(a-b)*(a-b)).sum::<f64>()>4.;
+     if fresh&&emit{*anchor=PositionAnchor{emitted_capture:CaptureStamp::default(),value_observed_capture:CaptureStamp::default(),observed_capture:CaptureStamp::default(),point,life,id:node.id,emitted:observed,value_observed:observed,observed,gap:false};}
+     else{if fresh{anchor.observed=observed;if point==anchor.point{anchor.value_observed=observed;}}anchor.gap=!fresh;}
+     anchor
+    }
+   };
+   node.xyz(Some(anchor.point));node.world_time=anchor.value_observed;node.position_observation_time=anchor.observed;node.position_observation_live=fresh;node.position_emitted_time=anchor.emitted;
+   node.set("world_age",if fresh&&anchor.value_observed==time{Some(0.)}else{None});
+   if fresh&&anchor.observed.is_some(){node.extras.insert("position-observation-age".into(),0.);}else{node.extras.remove("position-observation-age");}
+  }
+  self.positions.retain(|scope,_|present.contains(scope));
+ }
+ fn legacy_append_timing_oracle(&mut self,tick:i32,time:Option<f64>,mut current:BTreeMap<Scope,Node>){let _method_span=crate::direct_method_profile::span(49);
+  let started=FineInstant::now();self.legacy_position_policy_timing_oracle(time,&mut current);self.profile.elapsed("append.position_policy",started,current.len());
+  for(scope,node)in &mut current{
+   let started=FineInstant::now();let copied=0.;let explicit_source=node.source_time;let modifier=node.class.as_deref().is_some_and(|c|c.starts_with("modifier:"));
+   let changed=if let Some(old)=self.previous.get(scope).filter(|old|old.id==node.id&&old.owner==node.owner&&old.hero==node.hero&&old.team==node.team){
+    node.map_time=if node.get("map_age")==Some(0.){time}else{node.map_time.or(old.map_time)};
+    node.health_time=if node.get("health_age")==Some(0.){time}else{node.health_time.or(old.health_time)};
+    node.world_time=if node.get("world_age")==Some(0.){time}else{node.world_time.or(old.world_time)};
+    node.source_time=if modifier{explicit_source}else{explicit_source.or(old.source_time)};
+    !node.same_observation_content(old)
+   }else{node.source_time=if modifier{explicit_source}else{explicit_source.or(time)};if node.get("map_age")==Some(0.){node.map_time=time};if node.get("health_age")==Some(0.){node.health_time=time};if node.get("world_age")==Some(0.){node.world_time=time};true};
+   if changed{node.source_time=if modifier{explicit_source}else{explicit_source.or(time)};}
+   self.profile.add("append.comparison",started.elapsed().as_secs_f64()-copied,1);
+   if copied>0.{self.profile.add("append.comparable_copy",copied,1);}
+   if changed{let copy=FineInstant::now();self.rows.push((tick,time,node.clone()));self.profile.elapsed("append.output_copy",copy,1);}
+  }
+  let _lifecycle_method=crate::direct_method_profile::span(86);let copy=FineInstant::now();let before=self.rows.len();
+  for(scope,mut n)in std::mem::take(&mut self.previous){if !current.contains_key(&scope){n.active=false;n.values=[None;66];n.extras.clear();n.relations.clear();n.source_time=time;self.rows.push((tick,time,n));}}
+  self.previous=current;self.profile.elapsed("append.lifecycle_and_replacement",copy,self.rows.len()-before);
+ }
+}
+
+#[cfg(test)]mod timing_emission_parity_tests {
+ use super::*;
+ fn stamp(tick:i32,elapsed:Option<f64>)->CaptureStamp{CaptureStamp{capture_tick:Some(i64::from(tick)),timing_segment_id:Some(0),elapsed_play_seconds:elapsed}}
+ #[test]fn ordinary_emissions_and_all_original_columns_equal_exact_frozen_append_oracle(){
+  let mut reference=Collector::default();let mut actual=Collector::default();
+  for tick in 0..8{let time=20.+f64::from(tick)*0.25;let mut node=Node::new("ordinary".into(),"player",0);node.id=Some((1,1));node.set("health",Some(10.));node.set("health_age",Some(0.));node.set("visible",Some(if tick==5{0.}else{1.}));node.xyz(Some([match tick{0|1=>0.,2|3=>1.,_=>3.},0.,0.]));node.extras.insert("inventory-known".into(),1.);node.relations.push(("ordinary".into(),1));if tick==5{node.set("world_age",None);node.set("health_age",None);}
+   let nodes=if tick==7{Vec::new()}else{vec![node]};reference.legacy_append_timing_oracle(tick,Some(time),nodes.iter().cloned().map(|n|(n.scope(),n)).collect());
+   actual.capture_now=stamp(tick,Some(time));actual.e1_time_available=true;let projected=actual.projection_cache.project_test_nodes(nodes);actual.append_projected(tick,Some(time),projected);
+   assert_eq!(reference.rows.len(),actual.rows.len(),"extra transition at {tick}");
+  }
+  let(a,ae,ar)=actual.rows.frames().unwrap();let(b,be,br)=reference.rows.frames().unwrap();assert_eq!(a.height(),b.height());
+  for column in b.columns(){let name=column.name().as_str();if matches!(name,"elapsed_play_seconds"|"elapsed_play_known"|"timing_segment_id"|"e1_time_available")||name.ends_with("_capture_tick")||name.ends_with("_timing_segment_id")||name.ends_with("_elapsed_play_seconds")||name.ends_with("_elapsed_play_known"){continue;}assert!(a.column(name).unwrap().equals_missing(column),"legacy column changed: {name}");}assert!(ae.equals_missing(&be));assert!(ar.equals_missing(&br));
+ }
+ #[test]fn pause_and_raw_corrections_do_not_change_elapsed_gap_but_active_omission_does(){
+  let mut c=Collector::default();let mut node=Node::new("point".into(),"player",0);node.xyz(Some([0.,0.,0.]));
+  for(tick,raw,elapsed,point)in [(1,Some(0.),Some(0.),0.),(2,Some(100.),Some(0.25),1.),(3,None,None,1.),(4,Some(-100.),Some(0.25),1.)]{node.xyz(Some([point,0.,0.]));c.capture_now=stamp(tick,elapsed);c.e1_time_available=elapsed.is_some();let nodes=c.projection_cache.project_test_nodes([node.clone()]);c.append_projected(tick,raw,nodes);assert_eq!(c.positions[&node.scope()].point[0],0.,"pause/raw correction created gap");}
+  c.capture_now=stamp(5,Some(1.));c.e1_time_available=true;let nodes=c.projection_cache.project_test_nodes([node.clone()]);c.append_projected(5,Some(-99.25),nodes);assert_eq!(c.positions[&node.scope()].point[0],1.);
  }
 }

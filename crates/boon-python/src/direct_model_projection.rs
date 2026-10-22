@@ -240,8 +240,8 @@ fn apply_objective_latch(node:&mut Node,was_missing:bool,statuses:&[Option<bool>
 
 impl Collector{
  fn camp_position(&mut self,node:&mut Node,observed:Option<[f64;2]>,time:Option<f64>){let _method_span=crate::direct_method_profile::span(65);
-  if let Some(point)=observed{self.camp_positions.insert(node.key.clone(),(point,time));node.set("map_age",Some(0.));}
-  if let Some((point,at))=self.camp_positions.get(&node.key){node.set("map_x",Some(point[0]));node.set("map_y",Some(point[1]));node.map_time=*at;}
+  if let Some(point)=observed{self.camp_positions.insert(node.key.clone(),(point,time,self.capture_now));node.set("map_age",Some(0.));}
+  if let Some((point,at,capture))=self.camp_positions.get(&node.key){node.capture_stamps[MAP_CAPTURE]=*capture;node.set("map_x",Some(point[0]));node.set("map_y",Some(point[1]));node.map_time=*at;}
  }
  pub(super) fn project(&mut self,ctx:&Context,time:Option<f64>,classes:&HashMap<i64,String>,model_entities:&mut ModelEntityView)->DenseNodes{let _method_span=crate::direct_method_profile::span(66);
   if !self.projection_cache.seeded{self.projection_cache.observe(ctx,model_entities);}
@@ -314,7 +314,7 @@ impl Collector{
    self.projection_cache.remembered_scopes.insert(id);
    let node=out.output.get_id_mut(id).unwrap();node.set("protected",None);
    node.set("visible",Some(s.visible as u8 as f64));node.set("map_age",None);node.set("health_age",None);
-   if s.visible{node.set("map_x",s.x);node.set("map_y",s.y);if s.x.is_some()&&s.y.is_some(){node.set("map_age",Some(0.));node.map_time=time;}if !matches!(e.class_name.as_ref(),"CNPC_Trooper"|"CNPC_TrooperNeutral"|"CNPC_Neutral_Bug"){node.set("health_byte",s.health);if s.health.is_some(){node.set("health_age",Some(0.));node.health_time=time;}}node.set("protected",s.protected.map(|v|v as u8 as f64));}
+   if s.visible{node.set("map_x",s.x);node.set("map_y",s.y);if s.x.is_some()&&s.y.is_some(){node.set("map_age",Some(0.));node.map_time=time;node.capture_stamps[MAP_CAPTURE]=self.capture_now;}if !matches!(e.class_name.as_ref(),"CNPC_Trooper"|"CNPC_TrooperNeutral"|"CNPC_Neutral_Bug"){node.set("health_byte",s.health);if s.health.is_some(){node.set("health_age",Some(0.));node.health_time=time;node.capture_stamps[HEALTH_CAPTURE]=self.capture_now;}}node.set("protected",s.protected.map(|v|v as u8 as f64));}
 
   }}
   // Retain last qualified observations when storage/PVS drops an entity. This
@@ -334,7 +334,7 @@ impl Collector{
    let scope=if let Some((scope,values))=self.projection_cache.objective_rows.get(&id).filter(|(scope,_)|!self.projection_cache.dirty.contains(&e.index)&&out.has_all(&[*scope])){
     let scope=*scope;out.keep(&[scope]);let node=out.output.get_id_mut(scope).unwrap();
     node.values=*values;node.extras.remove("life-evidence:missing-objective-marker");node.extras.remove("position-observation-age");
-    node.source_time=None;node.map_time=None;node.health_time=None;node.world_time=None;node.position_observation_time=None;node.position_emitted_time=None;node.position_observation_live=false;
+    node.capture_stamps=[CaptureStamp::default();6];node.source_time=None;node.map_time=None;node.health_time=None;node.world_time=None;node.position_observation_time=None;node.position_emitted_time=None;node.position_observation_live=false;
     scope
    }else{
     let mut node=Node::entity(e,0);node.team=i(ctx,e,"m_iTeamNum");node.xyz(position(ctx,e));if node.get("world_x").is_some(){node.set("world_age",Some(0.));}node.copy_fields(ctx,e,CopyGroup::Objective,"",&[("health","m_iHealth"),("max_health","m_iMaxHealth"),("lifestate","m_lifeState")]);
@@ -415,7 +415,7 @@ impl Collector{
    if code==crate::snapshots::BARRIER_TRACKER_MODIFIER_ID{if let Some(v)=m.float2.filter(|v|v.is_finite()&&*v>=0.){if let Some(player)=out.get_mut(&(format!("player:{}",owner.steam),3,None)){player.set("barrier",Some(v as f64));}}}
    let binding=Binding::of(owner);
    if let Some((_,scope))=self.projection_cache.modifier_rows.get(serial).filter(|(old,scope)|*old==binding&&out.has_all(&[*scope])){out.keep(&[*scope]);continue}
-   let mut node=Node::new(format!("modifier:{}:{serial}",owner.steam),"upgrade",3);node.owned(owner);node.class=Some(format!("modifier:{code}"));node.source_time=self.modifier_times.get(serial).copied().flatten();node.ability=m.ability_subclass.map(i64::from);if let Some(v)=m.stack_count{node.extras.insert("stacks".into(),v as f64);}if let Some(v)=m.duration.filter(|v|v.is_finite()){node.extras.insert("duration".into(),v as f64);}if let Some(v)=m.creation_time.filter(|v|v.is_finite()){node.extras.insert("modifier-creation-source-clock".into(),v as f64);}let scope=put(&mut out,node);self.projection_cache.modifier_rows.insert(*serial,(binding,scope));}
+   let mut node=Node::new(format!("modifier:{}:{serial}",owner.steam),"upgrade",3);node.owned(owner);node.class=Some(format!("modifier:{code}"));let (raw_origin,capture_origin)=self.modifier_origin(*serial);node.source_time=raw_origin;node.capture_stamps[SOURCE_CAPTURE]=capture_origin;node.ability=m.ability_subclass.map(i64::from);if let Some(v)=m.stack_count{node.extras.insert("stacks".into(),v as f64);}if let Some(v)=m.duration.filter(|v|v.is_finite()){node.extras.insert("duration".into(),v as f64);}if let Some(v)=m.creation_time.filter(|v|v.is_finite()){node.extras.insert("modifier-creation-source-clock".into(),v as f64);}let scope=put(&mut out,node);self.projection_cache.modifier_rows.insert(*serial,(binding,scope));}
   self.profile.elapsed("projection.modifiers",phase,out.len()-before);
   self.projection_cache.channels=Some(chans);self.projection_cache.dirty.clear();self.projection_cache.dirty_groups.clear();self.projection_cache.dirty_slots.clear();self.projection_cache.finish(out)
  }
@@ -526,3 +526,11 @@ impl Collector{
 #[cfg(test)]
 #[path="direct_getter_plan_tests.rs"]
 mod getter_plan_tests;
+
+#[cfg(test)]mod timing_capture_tests {
+ use super::*;
+ #[test]fn camp_unknown_origin_survives_later_known_segment(){
+  let mut c=Collector::default();let captured=CaptureStamp{capture_tick:Some(5),timing_segment_id:Some(0),elapsed_play_seconds:None};c.capture_now=captured;let mut camp=Node::new("camp".into(),"neutral",0);c.camp_position(&mut camp,Some([3.,4.]),None);
+  c.capture_now=CaptureStamp{capture_tick:Some(15),timing_segment_id:Some(1),elapsed_play_seconds:Some(2.)};let mut carried=Node::new("camp".into(),"neutral",0);c.camp_position(&mut carried,None,Some(2.));assert_eq!(carried.capture_stamps[MAP_CAPTURE],captured);assert_eq!(carried.map_time,None);
+ }
+}

@@ -84,9 +84,9 @@ fn combined_pass_matches_existing_collectors_across_bounded_flushes_and_optional
     Python::attach(|py|for optional in [false,true] {
         let root=tempfile::tempdir().unwrap();let separate=root.path().join("separate");let combined=root.path().join("combined");
         let names=vec!["damage".into(),"abilities".into(),"resource_events".into()];
-        let mut old=source(false);let old_frames=old.direct_model_columns(py,vec![10,11,12],None,false).unwrap();
+        let mut old=source(false);let old_frames=old.direct_model_columns(py,vec![10,11,12],None,false,None).unwrap();
         let old_receipt=old.bounded_dataset_spool(py,separate.to_str().unwrap(),names.clone(),None,optional).unwrap();
-        let mut new=source(false);let (new_frames,new_receipt)=new.direct_model_columns_and_events(py,combined.to_str().unwrap(),vec![10,11,12],None,Some(names),None,optional,false).unwrap();
+        let mut new=source(false);let (new_frames,new_receipt)=new.direct_model_columns_and_events(py,combined.to_str().unwrap(),vec![10,11,12],None,Some(names),None,optional,false,None).unwrap();
         let old_receipt:serde_json::Value=serde_json::from_str(&old_receipt).unwrap();let new_receipt:serde_json::Value=serde_json::from_str(&new_receipt).unwrap();
         for field in ["rows","batches","batchRows","batchBytes","sourceTickAllowance","decodeCohorts","optionalEventsContract","optionalEventCoverage","manifestSha256","ownerStatus","peakTableCollectorRows","peakTableCollectorBytes"] {assert_eq!(old_receipt[field],new_receipt[field],"receipt {field}");}
         #[cfg(feature="direct-method-profile")]
@@ -121,11 +121,11 @@ fn combined_pass_matches_existing_collectors_across_bounded_flushes_and_optional
 fn empty_model_selection_still_collects_events_and_bad_cohorts_do_not_create_output() {
     Python::initialize();Python::attach(|py|{
         let root=tempfile::tempdir().unwrap();let path=root.path().join("empty");let mut demo=source(false);
-        let (frames,receipt)=demo.direct_model_columns_and_events(py,path.to_str().unwrap(),Vec::new(),None,None,None,true,false).unwrap();
+        let (frames,receipt)=demo.direct_model_columns_and_events(py,path.to_str().unwrap(),Vec::new(),None,None,None,true,false,None).unwrap();
         assert_eq!(model_frame(py,&frames,"clock").height(),0);
         assert_eq!(serde_json::from_str::<serde_json::Value>(&receipt).unwrap()["rows"]["damage"],1026);
         for names in [Vec::new(),vec!["player_ticks".into()],vec!["urn".into()],vec!["abilities".into()]] {
-            let path=root.path().join("invalid");assert!(demo.direct_model_columns_and_events(py,path.to_str().unwrap(),vec![10],None,Some(names),None,false,false).is_err());assert!(!path.exists());
+            let path=root.path().join("invalid");assert!(demo.direct_model_columns_and_events(py,path.to_str().unwrap(),vec![10],None,Some(names),None,false,false,None).is_err());assert!(!path.exists());
         }
     });
 }
@@ -138,6 +138,51 @@ fn observer_cancellation_and_malformed_events_never_publish_completion() {
         assert!(demo.collect_datasets_with_observer(py,&[Dataset::Damage],Some(&mut spool),None,None,Some(&mut visit)).is_err());
         assert_eq!(seen,1);assert!(!path.join("complete.json").exists());assert!(std::fs::read_to_string(path.join("batches.jsonl")).unwrap().is_empty());
         let path=root.path().join("malformed");let mut demo=source(true);
-        assert!(demo.direct_model_columns_and_events(py,path.to_str().unwrap(),vec![10,11,12],None,None,None,true,false).is_err());assert!(!path.join("complete.json").exists());
+        assert!(demo.direct_model_columns_and_events(py,path.to_str().unwrap(),vec![10,11,12],None,None,None,true,false,None).is_err());assert!(!path.join("complete.json").exists());
+    });
+}
+
+#[test]
+fn selected_progress_counts_postgame_and_missing_ticks_without_fabricating_completion() {
+    Python::initialize();Python::attach(|py|{
+        let scope=pyo3::types::PyDict::new(py);
+        py.run(c"samples=[]\ndef progress(visited,total,phase): samples.append((visited,total,phase))",Some(&scope),None).unwrap();
+        let callback=scope.get_item("progress").unwrap().unwrap().unbind();
+        let root=tempfile::tempdir().unwrap();let path=root.path().join("measured");let mut demo=source(false);
+        let (frames,_)=demo.direct_model_columns_and_events(py,path.to_str().unwrap(),vec![10,10,11,12,99],None,None,None,true,false,Some(callback)).unwrap();
+        let samples:Vec<(usize,usize,String)>=scope.get_item("samples").unwrap().unwrap().extract().unwrap();
+        assert_eq!(samples.first(),Some(&(0,4,"decode".into())));
+        assert_eq!(samples.last(),Some(&(3,4,"finalize".into())));
+        assert!(samples.windows(2).all(|w|w[0].0<=w[1].0&&w[0].1==4&&w[1].1==4));
+        assert_eq!(samples[samples.len()-2],(3,4,"decode".into()));
+        assert!(samples[..samples.len()-1].iter().all(|sample|sample.2=="decode"));
+        let diagnostics=model_frame(py,&frames,"diagnostics");
+        assert_eq!(diagnostics.column("selected_ticks").unwrap().u64().unwrap().get(0),Some(1));
+    });
+}
+#[test]
+fn selected_progress_errors_abort_without_completion_receipt() {
+    Python::initialize();Python::attach(|py|{
+        let scope=pyo3::types::PyDict::new(py);
+        py.run(c"def progress(visited,total,phase):\n if phase == 'finalize': raise RuntimeError('selected-progress-stop')",Some(&scope),None).unwrap();
+        let callback=scope.get_item("progress").unwrap().unwrap().unbind();
+        let root=tempfile::tempdir().unwrap();let path=root.path().join("cancelled-progress");let mut demo=source(false);
+        let error=demo.direct_model_columns_and_events(py,path.to_str().unwrap(),vec![10,11,12],None,None,None,true,false,Some(callback)).unwrap_err();
+        assert!(error.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py));
+        assert!(error.to_string().contains("selected-progress-stop"));
+        assert!(!path.join("complete.json").exists());
+    });
+}
+
+#[test]
+fn empty_selected_progress_marks_unestimated_finalization() {
+    Python::initialize();Python::attach(|py|{
+        let scope=pyo3::types::PyDict::new(py);
+        py.run(c"samples=[]\ndef progress(visited,total,phase): samples.append((visited,total,phase))",Some(&scope),None).unwrap();
+        let callback=scope.get_item("progress").unwrap().unwrap().unbind();
+        let root=tempfile::tempdir().unwrap();let path=root.path().join("empty-progress");let mut demo=source(false);
+        demo.direct_model_columns_and_events(py,path.to_str().unwrap(),vec![],None,None,None,true,false,Some(callback)).unwrap();
+        let samples:Vec<(usize,usize,String)>=scope.get_item("samples").unwrap().unwrap().extract().unwrap();
+        assert_eq!(samples,vec![(0,0,"decode".into()),(0,0,"finalize".into())]);
     });
 }

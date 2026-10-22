@@ -4,6 +4,9 @@
 use super::*;
 
 pub(super) struct EmittedRows {
+    capture_stamps:[Vec<CaptureStamp>;6],
+    emission_clock:Vec<CaptureStamp>,
+    e1_time_available:Vec<bool>,
     tick: Vec<i32>,
     match_seconds: Vec<Option<f64>>,
     entity_index: Vec<Option<i32>>,
@@ -45,6 +48,9 @@ impl Default for EmittedRows {
 impl EmittedRows {
     pub(super) fn with_capacity(capacity: usize) -> Self {
         Self {
+            capture_stamps:std::array::from_fn(|_|Vec::with_capacity(capacity)),
+            emission_clock:Vec::with_capacity(capacity),
+            e1_time_available:Vec::with_capacity(capacity),
             tick: Vec::with_capacity(capacity),
             match_seconds: Vec::with_capacity(capacity),
             entity_index: Vec::with_capacity(capacity),
@@ -84,6 +90,8 @@ impl EmittedRows {
         let update_row = self.len() as u64;
         #[cfg(test)]
         self.records.push((tick, time, node.clone()));
+        for (values,capture) in self.capture_stamps.iter_mut().zip(node.capture_stamps){values.push(capture);}
+        self.emission_clock.push(node.emission_clock);self.e1_time_available.push(node.e1_time_available);
         self.tick.push(tick);
         self.match_seconds.push(time);
         self.entity_index.push(node.id.map(|id| id.0));
@@ -152,6 +160,16 @@ impl EmittedRows {
         columns.push(column!(position_emitted_time));
         for (name, values) in FIELDS.into_iter().zip(self.values) {
             columns.push(Column::new(name.into(), values));
+        }
+        columns.push(Column::new("elapsed_play_seconds".into(),self.emission_clock.iter().map(|s|s.elapsed_play_seconds).collect::<Vec<_>>()));
+        columns.push(Column::new("elapsed_play_known".into(),self.emission_clock.iter().map(|s|s.elapsed_play_seconds.is_some()).collect::<Vec<_>>()));
+        columns.push(Column::new("timing_segment_id".into(),self.emission_clock.iter().map(|s|s.timing_segment_id).collect::<Vec<_>>()));
+        columns.push(Column::new("e1_time_available".into(),self.e1_time_available));
+        for(prefix,captures)in ["source","map","health","world","position_observation","position_emitted"].into_iter().zip(self.capture_stamps){
+            columns.push(Column::new(format!("{prefix}_capture_tick").into(),captures.iter().map(|s|s.capture_tick).collect::<Vec<_>>()));
+            columns.push(Column::new(format!("{prefix}_timing_segment_id").into(),captures.iter().map(|s|s.timing_segment_id).collect::<Vec<_>>()));
+            columns.push(Column::new(format!("{prefix}_elapsed_play_seconds").into(),captures.iter().map(|s|s.elapsed_play_seconds).collect::<Vec<_>>()));
+            columns.push(Column::new(format!("{prefix}_elapsed_play_known").into(),captures.iter().map(|s|s.elapsed_play_seconds.is_some()).collect::<Vec<_>>()));
         }
         let updates = df_from_columns(columns)?;
         let extras = df_from_columns(vec![
@@ -231,9 +249,10 @@ mod tests {
 
     fn assert_frames_equal(actual: (DataFrame, DataFrame, DataFrame), expected: (DataFrame, DataFrame, DataFrame)) {
         for (actual, expected) in [actual.0, actual.1, actual.2].into_iter().zip([expected.0, expected.1, expected.2]) {
-            assert_eq!(actual.schema(), expected.schema());
-            assert_eq!(actual.shape(), expected.shape());
-            for (actual, expected) in actual.columns().iter().zip(expected.columns()) {
+            assert_eq!(actual.height(), expected.height());
+            for expected in expected.columns() {
+                let actual=actual.column(expected.name()).unwrap();
+                assert_eq!(actual.dtype(),expected.dtype());
                 assert!(actual.equals_missing(expected), "different column {}", actual.name());
             }
         }

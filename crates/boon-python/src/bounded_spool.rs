@@ -207,10 +207,13 @@ impl Demo {
     /// Collect full model columns and bounded recorded events in one source pass.
     /// Event rows use the same collectors as bounded_dataset_spool. The event
     /// destination must not exist. Its completion receipt is written last.
-    #[pyo3(signature = (path, *, ticks, entity_classes=None, datasets=None, progress=None, optional_events=false, method_profile=false))]
+    /// selected_tick_progress(visited, total, phase) counts unique requested completed
+    /// ticks. phase="finalize" precedes unestimated dataframe construction.
+    /// The existing progress callback retains event-spool pressure units.
+    #[pyo3(signature = (path, *, ticks, entity_classes=None, datasets=None, progress=None, optional_events=false, method_profile=false, selected_tick_progress=None))]
     pub(crate) fn direct_model_columns_and_events(
         &mut self,py:Python<'_>,path:&str,ticks:Vec<i32>,entity_classes:Option<HashMap<i64,String>>,
-        datasets:Option<Vec<String>>,progress:Option<Py<PyAny>>,optional_events:bool,method_profile:bool,
+        datasets:Option<Vec<String>>,progress:Option<Py<PyAny>>,optional_events:bool,method_profile:bool,selected_tick_progress:Option<Py<PyAny>>,
     )->PyResult<(Py<PyDict>,String)> {
         if method_profile&&!crate::direct_method_profile::AVAILABLE {
             return Err(pyo3::exceptions::PyValueError::new_err("method profiling requires an artifact built with direct-method-profile"));
@@ -222,7 +225,7 @@ impl Demo {
         spool.shared_model_columns=true;
         spool.decode_cohorts.push(datasets.iter().map(|dataset|dataset.as_str().to_owned()).collect());
         let source=SharedModelSource {demo:self,datasets:&datasets,spool:&mut spool};
-        let frames=crate::direct_model_columns::collect_model_columns(py,ticks,entity_classes,method_profile,source)?;
+        let frames=crate::direct_model_columns::collect_model_columns(py,ticks,entity_classes,method_profile,selected_tick_progress,source)?;
         spool.owner_status=Some(self.bounded_owner_status());
         Ok((frames,spool.finish()?))
     }
